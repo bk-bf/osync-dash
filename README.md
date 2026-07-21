@@ -10,9 +10,11 @@ pending-changes dry-run.
 │ ● HEALTHY    last sync 2m   mode bidirectional           │
 ╰──────────────────────────────────────────────────────────╯
 ╭─ devices ────────────────────────────────────────────────╮
-│   device            up  rsync  files  size   free         │
-│ ▸ initiator (local) ●   ✓      350    235M   300G         │
-│ ▸ target host       ●   ✓      350    235M   534G         │
+│   device               up  rsync  files  size   free      │
+│ ▸ initiator my-laptop  ●   ✓      350    235M   300G      │
+│   ↳ tailscale my-laptop  ·  100.x.y.z                     │
+│ ▸ target    my-server  ●   ✓      350    235M   534G      │
+│   ↳ tailscale my-server  ·  100.a.b.c                     │
 ╰──────────────────────────────────────────────────────────╯
   + sync state · paths · safety net · pending (dry-run)
 ```
@@ -60,6 +62,7 @@ fzf-picks (or falls back to the first). See `osync-dash --help` for all flags.
 |--------------|--------|
 | health       | `*-last-action-<instance>` + `resume-count-<instance>` state files, plus live reachability |
 | last run     | mtime of the initiator `last-action` state file |
+| devices      | system hostname (local `gethostname`, remote `hostname`) + Tailscale device name/IP from `tailscale status` |
 | files/size   | live walk locally; one combined `ssh` probe remotely |
 | free space   | `statvfs` locally, `df` remotely |
 | safety net   | file counts under `.osync_workdir/{deleted,backup}` on both sides |

@@ -29,9 +29,11 @@ Options:
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -150,8 +152,53 @@ def run(cmd, timeout=20) -> tuple[int, str]:
 
 
 # ── probes ──────────────────────────────────────────────────────────────────
+def tailscale_map() -> dict:
+    """Map lowercased hostname AND tailnet IPv4 -> {name, ip} for tailscale nodes.
+
+    'name' is the short MagicDNS label (first component of the DNSName). Empty
+    dict if tailscale isn't installed / not up — everything degrades gracefully.
+    """
+    if not shutil.which("tailscale"):
+        return {}
+    rc, out = run(["tailscale", "status", "--json"], timeout=6)
+    if rc != 0 or "{" not in out:
+        return {}
+    try:
+        # run() merges stderr (tailscale emits a version-skew warning there),
+        # so decode just the leading JSON object and ignore any trailing text.
+        data, _ = json.JSONDecoder().raw_decode(out[out.index("{"):])
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    m: dict = {}
+    nodes = [data.get("Self", {})] + list((data.get("Peer") or {}).values())
+    for n in nodes:
+        if not n:
+            continue
+        dns = (n.get("DNSName") or "").rstrip(".")
+        name = dns.split(".")[0] if dns else (n.get("HostName") or "")
+        ip4 = next((ip for ip in (n.get("TailscaleIPs") or []) if ":" not in ip), None)
+        entry = {"name": name, "ip": ip4, "dns": dns}
+        if n.get("HostName"):
+            m.setdefault(n["HostName"].lower(), entry)
+        if ip4:
+            m[ip4] = entry
+    return m
+
+
+def resolve_ssh_host(host: str) -> str | None:
+    """Ask ssh what a Host alias actually resolves to (no network hit)."""
+    rc, out = run(["ssh", "-G", host], timeout=6)
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        if line.lower().startswith("hostname "):
+            return line.split(None, 1)[1].strip()
+    return None
+
+
 def probe_local(sync_dir: Path) -> dict:
-    d = {"reach": sync_dir.is_dir(), "rsync": bool(shutil.which("rsync"))}
+    d = {"reach": sync_dir.is_dir(), "rsync": bool(shutil.which("rsync")),
+         "host": socket.gethostname()}
     if not d["reach"]:
         return d
     files = size = 0
@@ -306,22 +353,27 @@ def render(cfg, tgt, state, local, remote, width) -> str:
     lines += box(f"osync · {cfg.get('INSTANCE_ID', '?')}", [f"{badge}    {sub}"], width, col)
     lines.append("")
 
-    # devices table
-    def devrow(name, label, r):
+    # devices table — role + real hostname, with a Tailscale identity sub-line
+    def dev_lines(role, r):
         reach = r.get("reach", False)
         rs = "✓" if r.get("rsync") else ("—" if not reach else "✗")
         files = "—" if r.get("files") is None else str(r.get("files"))
         size = humansize(r.get("size")) if r.get("size") is not None else "—"
         free = humansize(r.get("free")) if r.get("free") is not None else "—"
-        nm = pad(f"{CYAN}▸{RESET} {name} {GREY}{label}{RESET}", 30)
-        return f"{nm}{pad(dot(reach), 4)}{pad(rs, 8)}{pad(files, 8)}{pad(size, 9)}{free}"
+        host = r.get("host") or (r.get("ts") or {}).get("name") or "—"
+        cell = pad(f"{CYAN}▸{RESET} {pad(role, 9)} {WHITE}{host}{RESET}", 30)
+        out = [f"{cell}{pad(dot(reach), 4)}{pad(rs, 8)}{pad(files, 8)}{pad(size, 9)}{free}"]
+        ts = r.get("ts")
+        if ts and ts.get("name"):
+            ip = ts.get("ip") or ""
+            out.append(f"  {DIM}↳ tailscale{RESET} {GREY}{ts['name']}{('  ·  ' + ip) if ip else ''}{RESET}")
+        return out
 
+    tgt_dev = remote if tgt.get("remote") else local
     hdr = f"{GREY}{pad('  device', 30)}{pad('up', 4)}{pad('rsync', 8)}{pad('files', 8)}{pad('size', 9)}free{RESET}"
-    drows = [hdr,
-             devrow("initiator", "(local)", local),
-             devrow("target", f"{tgt.get('host','')}", remote if tgt.get("remote") else local)]
+    drows = [hdr] + dev_lines("initiator", local) + dev_lines("target", tgt_dev)
     if tgt.get("remote") and not remote.get("reach", False):
-        drows.append(f"{YELLOW}  ! target: {remote.get('err','unreachable')}{RESET}")
+        drows.append(f"{YELLOW}  ! target: {remote.get('err', 'unreachable')}{RESET}")
     lines += box("devices", drows, width, GREY)
     lines.append("")
 
@@ -363,7 +415,7 @@ def render(cfg, tgt, state, local, remote, width) -> str:
            f"   init {WHITE}{li}{RESET} / target {WHITE}{ri if ri is not None else '—'}{RESET}   {GREY}kept {sd_days}d{RESET}", 14),
         kv("conflict-bkp", (f"{GREEN}on{RESET}" if cb_on else f"{GREY}off{RESET}") +
            f"   init {WHITE}{lb}{RESET} / target {WHITE}{rb if rb is not None else '—'}{RESET}   {GREY}kept {cb_days}d{RESET}", 14),
-        kv("winner", f"{cfg.get('CONFLICT_PREVALANCE','initiator')} {GREY}(same-timestamp conflicts){RESET}", 14),
+        kv("winner", f"{GREEN}newest mtime{RESET}   {GREY}· tie → {cfg.get('CONFLICT_PREVALANCE','initiator')} (same-timestamp only){RESET}", 14),
     ]
     excl = cfg.get("RSYNC_EXCLUDE_PATTERN", "").strip()
     if excl:
@@ -430,6 +482,18 @@ def gather(cfg, tgt, local_only=False):
     local = probe_local(sync_dir)
     remote = probe_remote(cfg, tgt) if (tgt.get("remote") and not local_only) else {"reach": False, "err": "skipped"}
     state = probe_state(cfg, sync_dir)
+
+    ts = tailscale_map()
+    if ts:
+        local["ts"] = ts.get((local.get("host") or "").lower())
+        if tgt.get("remote"):
+            ident = ts.get((remote.get("host") or "").lower())
+            if not ident:  # ssh probe may have failed; match via the alias's IP
+                ip = resolve_ssh_host(tgt.get("host", ""))
+                ident = ts.get(ip) if ip else None
+            remote["ts"] = ident
+            if not remote.get("host") and ident:  # surface a name even when offline
+                remote["host"] = ident.get("name")
     return state, local, remote
 
 
