@@ -8,27 +8,30 @@ third-party libraries — pure Python stdlib + the tools osync already needs.
 Usage:
     osync-dash [-c CONFIG] [options]
 
-By default it shows EVERYTHING in one shot: health, devices, paths, the
-safety net, and a live pending-changes dry-run. Flags only tweak that.
+Run with no arguments for the interactive full-screen TUI (auto-refreshing,
+keyboard-driven). In the TUI:  r refresh · c check pending · s sync · l log
+· ↑/↓/PgUp/PgDn/g/G scroll · q quit.
+
+Piped or with --print it falls back to a one-shot render of the same panels.
 
 Options:
     -c, --config PATH   osync .conf to inspect. Default: auto-discover in
                         ~/.config/osync (fzf-picks if more than one).
-    -f, --fast          Skip the pending dry-run (no ssh rsync pass) for a
-                        quick status-only view.
-    -w, --watch         Live mode: redraw every --interval seconds. Skips the
-                        pending dry-run each cycle (add --check to force it).
-    -i, --interval N    Refresh seconds for --watch (default 5).
-        --check         Force the pending dry-run even in --watch.
-        --sync          Run the sync now (streams osync output), then show the
-                        dashboard. Extra args after -- are passed to osync.
+    -p, --print         One-shot render to stdout instead of the TUI (also the
+                        automatic behaviour when output is piped).
+    -f, --fast          Skip the pending dry-run (no ssh rsync pass).
+    -i, --interval N    TUI auto-refresh seconds (default 6).
+        --check         Include the pending dry-run in --print output.
+        --sync          Run the sync now (streams osync output), print the
+                        result, exit. Extra args after -- are passed to osync.
         --log           Page the full osync log (less), then exit.
         --local-only    Skip the remote ssh probe (offline / fast).
-        --no-color      Disable ANSI colour.
+        --no-color      Disable ANSI colour (--print mode).
     -h, --help          This help.
 """
 from __future__ import annotations
 
+import curses
 import json
 import os
 import re
@@ -36,6 +39,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -64,6 +68,10 @@ def fg(n: int) -> str:
 GREEN, YELLOW, RED, BLUE, CYAN, GREY, WHITE, MAGENTA = (
     fg(114), fg(179), fg(203), fg(75), fg(80), fg(244), fg(252), fg(176),
 )
+
+# name -> ANSI, shared with health(); the curses front-end maps the same names
+ANSI_BY_NAME = dict(green=GREEN, yellow=YELLOW, red=RED, blue=BLUE,
+                    cyan=CYAN, grey=GREY, white=WHITE, magenta=MAGENTA)
 
 
 def strip_ansi(s: str) -> int:
@@ -292,22 +300,23 @@ def probe_state(cfg: dict, sync_dir: Path) -> dict:
 
 
 def health(state: dict, remote: dict, local: dict) -> tuple[str, str]:
+    """Return (label, colour-name). Name is mapped to ANSI or curses per front-end."""
     if state["running"]:
-        return "RUNNING", BLUE
+        return "RUNNING", "blue"
     if state["last_ts"] is None:
-        return "NEVER RUN", GREY
+        return "NEVER RUN", "grey"
     if not local.get("reach"):
-        return "NO LOCAL DIR", RED
+        return "NO LOCAL DIR", "red"
     if not remote.get("reach", True):
-        return "TARGET UNREACHABLE", YELLOW
+        return "TARGET UNREACHABLE", "yellow"
     bad = (state.get("init_action") not in (None, "synced")
            or state.get("tgt_action") not in (None, "synced")
            or (state.get("resume") not in (None, "0", "")))
     if bad:
-        return "ERROR", RED
+        return "ERROR", "red"
     if time.time() - state["last_ts"] > STALE_AFTER:
-        return "STALE", YELLOW
-    return "HEALTHY", GREEN
+        return "STALE", "yellow"
+    return "HEALTHY", "green"
 
 
 # ── rendering ───────────────────────────────────────────────────────────────
@@ -341,6 +350,7 @@ def dot(ok, warn=False) -> str:
 
 def render(cfg, tgt, state, local, remote, width) -> str:
     st, col = health(state, remote, local)
+    col = ANSI_BY_NAME.get(col, "")
     age = human_age(time.time() - state["last_ts"] if state["last_ts"] else None)
     stype = cfg.get("SYNC_TYPE", "").strip() or "bidirectional"
     lines: list[str] = []
@@ -497,10 +507,360 @@ def gather(cfg, tgt, local_only=False):
     return state, local, remote
 
 
+# ── curses TUI ──────────────────────────────────────────────────────────────
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _vis(spans) -> int:
+    return sum(len(t) for t, _ in spans)
+
+
+class TUI:
+    """Full-screen interactive dashboard. Data is refreshed in a background
+    thread so ssh probes never block keyboard input."""
+
+    def __init__(self, stdscr, cfg, tgt, cfg_path, local_only=False, interval=6, want_pending=True):
+        self.stdscr = stdscr
+        self.cfg, self.tgt, self.cfg_path = cfg, tgt, cfg_path
+        self.local_only = local_only
+        self.interval = max(2, interval)
+        self.lock = threading.Lock()
+        self.data = None            # (state, local, remote)
+        self.pending = None         # dict | None
+        self.refreshing = False
+        self.pending_running = False
+        self.last_refresh = 0.0
+        self.scroll = 0
+        self.spin = 0
+        self.msg = ""
+        self.want_pending = want_pending
+        self.CA = {}
+
+    # colours ----------------------------------------------------------------
+    def init_colors(self):
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+        except curses.error:
+            pass
+        has = curses.has_colors()
+        use256 = has and curses.COLORS >= 256
+        pal = (dict(green=114, yellow=179, red=203, blue=75, cyan=80, grey=244, white=252, magenta=176)
+               if use256 else
+               dict(green=2, yellow=3, red=1, blue=4, cyan=6, grey=7, white=7, magenta=5))
+        for i, (name, code) in enumerate(pal.items(), start=1):
+            try:
+                curses.init_pair(i, code, -1)
+                self.CA[name] = curses.color_pair(i)
+            except curses.error:
+                self.CA[name] = 0
+        self.CA["dim"] = curses.A_DIM
+        self.CA["bold"] = curses.A_BOLD
+        self.CA["reverse"] = curses.A_REVERSE
+
+    def C(self, *names) -> int:
+        attr = 0
+        for n in names:
+            attr |= self.CA.get(n, 0)
+        return attr
+
+    # background refresh -----------------------------------------------------
+    def _do_refresh(self):
+        self.refreshing = True
+        try:
+            d = gather(self.cfg, self.tgt, self.local_only)
+            with self.lock:
+                self.data = d
+        except Exception as e:  # never let a probe error kill the UI
+            self.msg = f"refresh error: {e}"
+        finally:
+            self.last_refresh = time.monotonic()
+            self.refreshing = False
+
+    def _do_pending(self):
+        self.pending_running = True
+        try:
+            p = compute_pending(self.cfg_path)
+            with self.lock:
+                self.pending = p
+        except Exception as e:
+            self.msg = f"check error: {e}"
+        finally:
+            self.pending_running = False
+
+    def trigger_refresh(self):
+        if not self.refreshing:
+            threading.Thread(target=self._do_refresh, daemon=True).start()
+
+    def trigger_pending(self):
+        if not self.pending_running:
+            threading.Thread(target=self._do_pending, daemon=True).start()
+
+    # content builders -------------------------------------------------------
+    def build_blocks(self):
+        C = self.C
+        with self.lock:
+            data, pending = self.data, self.pending
+        cfg, tgt = self.cfg, self.tgt
+        if not data:
+            return [("osync", C("cyan"), [[("gathering status…", C("grey"))]])]
+        state, local, remote = data
+        st, cname = health(state, remote, local)
+        hcol = C(cname)
+        age = human_age(time.time() - state["last_ts"] if state["last_ts"] else None)
+        stype = cfg.get("SYNC_TYPE", "").strip() or "bidirectional"
+        blocks = []
+
+        # header
+        head = [("● ", hcol | curses.A_BOLD), (st, hcol | curses.A_BOLD),
+                ("    last sync ", C("grey")), (age, C("white")),
+                ("   mode ", C("grey")), (stype, C("white"))]
+        if state["running"]:
+            head = [("● ", C("blue") | curses.A_BOLD), ("sync in progress…  ", C("blue"))] + head[2:]
+        blocks.append((f"osync · {cfg.get('INSTANCE_ID', '?')}", hcol, [head]))
+
+        # devices
+        def dev_lines(role, r):
+            reach = r.get("reach", False)
+            dcol = C("green") if reach else C("red")
+            rs = "✓" if r.get("rsync") else ("—" if not reach else "✗")
+            files = "—" if r.get("files") is None else str(r.get("files"))
+            size = humansize(r.get("size")) if r.get("size") is not None else "—"
+            free = humansize(r.get("free")) if r.get("free") is not None else "—"
+            host = r.get("host") or (r.get("ts") or {}).get("name") or "—"
+            main = [("▸ ", C("cyan")), (f"{role:<9} ", 0), (f"{host:<16}", C("white")),
+                    ("● ", dcol), (f"{rs:<6}", 0), (f"{files:<7}", 0),
+                    (f"{size:<8}", 0), (free, 0)]
+            out = [main]
+            ts = r.get("ts")
+            if ts and ts.get("name"):
+                ip = ts.get("ip") or ""
+                out.append([("  ↳ tailscale ", C("dim")),
+                            (ts["name"] + (f"  ·  {ip}" if ip else ""), C("grey"))])
+            return out
+
+        tgt_dev = remote if tgt.get("remote") else local
+        drows = [[(f"  {'device':<9} {'host':<16}{'up':<6}{'rsync':<7}{'files':<7}{'size':<8}free", C("grey"))]]
+        drows += dev_lines("initiator", local)
+        drows += dev_lines("target", tgt_dev)
+        if tgt.get("remote") and not remote.get("reach", False):
+            drows.append([("  ! target: " + str(remote.get("err", "unreachable")), C("yellow"))])
+        blocks.append(("devices", C("grey"), drows))
+
+        # sync state
+        res = state.get("init_action") or "—"
+        rcol = C("green") if res == "synced" else (C("grey") if res == "—" else C("red"))
+        resume = state.get("resume")
+        lastrun = (time.strftime("%Y-%m-%d %H:%M", time.localtime(state["last_ts"]))
+                   if state["last_ts"] else "never")
+
+        def kvl(k, spans):
+            return [(f"{k:<13}", C("grey"))] + spans
+
+        srows = [
+            kvl("last run", [(lastrun, C("white")), (f"  ({age} ago)", C("grey"))]),
+            kvl("result", [(res, rcol), ("   target: ", 0),
+                           (str(state.get("tgt_action") or "—"),
+                            C("green") if state.get("tgt_action") == "synced" else C("grey"))]),
+            kvl("resume", [("0 (clean)", C("green")) if resume in ("0", None)
+                           else (f"{resume} (retried)", C("red"))]),
+            kvl("running", [("yes", C("blue")) if state["running"] else ("no", C("grey"))]),
+        ]
+        blocks.append(("sync state", hcol, srows))
+
+        # paths
+        prows = [
+            kvl("initiator", [(cfg.get("INITIATOR_SYNC_DIR", "?"), C("white"))]),
+            kvl("target", [(f"{tgt.get('user','')}@{tgt.get('host','')}:{tgt.get('path','?')}"
+                            if tgt.get("remote") else cfg.get("TARGET_SYNC_DIR", "?"), C("white"))]),
+            kvl("workdir", [(f"{cfg.get('INITIATOR_SYNC_DIR','')}/{OSYNC_DIR}", C("dim"))]),
+            kvl("log", [(cfg.get("LOGFILE", "—") or "—", C("dim"))]),
+            kvl("config", [(cfg.get("_configfile", ""), C("dim"))]),
+        ]
+        blocks.append(("paths", C("cyan"), prows))
+
+        # safety net
+        li, ri = local.get("deleted", 0), (remote.get("deleted") if tgt.get("remote") else local.get("deleted"))
+        lb, rb = local.get("backup", 0), (remote.get("backup") if tgt.get("remote") else local.get("backup"))
+        sd_on = cfg.get("SOFT_DELETE", "true") == "true"
+        cb_on = cfg.get("CONFLICT_BACKUP", "true") == "true"
+
+        def onoff(v):
+            return ("on", C("green")) if v else ("off", C("grey"))
+
+        netrows = [
+            [(f"{'soft-delete':<14}", C("grey")), onoff(sd_on),
+             (f"   init {li} / target {ri if ri is not None else '—'}", 0),
+             (f"   kept {cfg.get('SOFT_DELETE_DAYS','?')}d", C("grey"))],
+            [(f"{'conflict-bkp':<14}", C("grey")), onoff(cb_on),
+             (f"   init {lb} / target {rb if rb is not None else '—'}", 0),
+             (f"   kept {cfg.get('CONFLICT_BACKUP_DAYS','?')}d", C("grey"))],
+            [(f"{'winner':<14}", C("grey")), ("newest mtime", C("green")),
+             (f"   · tie → {cfg.get('CONFLICT_PREVALANCE','initiator')} (same-timestamp only)", C("grey"))],
+        ]
+        excl = cfg.get("RSYNC_EXCLUDE_PATTERN", "").strip()
+        if excl:
+            netrows.append([(f"{'excludes':<14}", C("grey")), (excl, C("yellow"))])
+        blocks.append(("safety net", C("magenta"), netrows))
+
+        # pending
+        if self.pending_running:
+            blocks.append(("pending (dry-run)", C("grey"),
+                           [[("computing… ", C("grey"))]]))
+        elif pending is not None:
+            if pending["total"] == 0:
+                pr = [[("in sync — nothing pending", C("green"))]]
+                pc = C("green")
+            else:
+                pr = [[(f"{pending['total']} pending", C("yellow")),
+                       (f"   →target {pending['tu']}u/{pending['td']}d", C("grey")),
+                       (f"   →init {pending['iu']}u/{pending['id']}d", C("grey"))]]
+                pc = C("yellow")
+            blocks.append(("pending (dry-run)", pc, pr))
+        else:
+            blocks.append(("pending (dry-run)", C("grey"),
+                           [[("press ", C("grey")), ("c", C("white")), (" to check for pending changes", C("grey"))]]))
+        return blocks
+
+    # drawing ----------------------------------------------------------------
+    def _make_box(self, title, border, lines, width):
+        inner = width - 2
+        dashn = max(0, inner - len(title) - 3)
+        out = [[("╭─ ", border), (title, border | curses.A_BOLD), (" " + "─" * dashn + "╮", border)]]
+        for spans in lines:
+            padn = max(0, (inner - 2) - _vis(spans))
+            out.append([("│ ", border)] + list(spans) + [(" " * padn, 0), (" │", border)])
+        out.append([("╰" + "─" * inner + "╯", border)])
+        return out
+
+    def _draw_line(self, y, spans, maxx):
+        cx = 0
+        for text, attr in spans:
+            if cx >= maxx or not text:
+                break
+            t = text[:maxx - cx]
+            try:
+                self.stdscr.addstr(y, cx, t, attr)
+            except curses.error:
+                pass
+            cx += len(t)
+
+    def draw(self):
+        self.stdscr.erase()
+        maxy, maxx = self.stdscr.getmaxyx()
+        width = max(40, min(maxx, 108))
+        screen = []
+        for title, border, lines in self.build_blocks():
+            screen += self._make_box(title, border, lines, width)
+            screen.append([])
+        body_h = max(1, maxy - 1)
+        total = len(screen)
+        self.scroll = max(0, min(self.scroll, max(0, total - body_h)))
+        for i, spans in enumerate(screen[self.scroll:self.scroll + body_h]):
+            self._draw_line(i, spans, maxx)
+        self._draw_footer(maxy - 1, maxx, total > body_h)
+        self.stdscr.noutrefresh()
+        curses.doupdate()
+
+    def _draw_footer(self, y, maxx, scrollable):
+        busy = self.refreshing or self.pending_running
+        mark = SPINNER[self.spin % len(SPINNER)] if busy else "●"
+        secs = int(time.monotonic() - self.last_refresh) if self.last_refresh else 0
+        keys = " q quit · r refresh · c check · s sync · l log"
+        if scrollable:
+            keys += " · ↑↓ scroll"
+        right = f"{mark} {'refreshing' if busy else f'{secs}s ago'} "
+        if self.msg:
+            right = f"{self.msg[:40]}  " + right
+        line = keys + " " * max(1, maxx - len(keys) - len(right) - 1) + right
+        try:
+            self.stdscr.addstr(y, 0, line[:maxx - 1], self.C("reverse"))
+        except curses.error:
+            pass
+
+    # actions ----------------------------------------------------------------
+    def _suspend(self, fn):
+        curses.endwin()
+        try:
+            fn()
+        finally:
+            self.stdscr.clear()
+            self.stdscr.refresh()
+
+    def action_sync(self):
+        def go():
+            print("\n\033[36m▶ Running osync sync…\033[0m\n")
+            subprocess.run([OSYNC_BIN, str(self.cfg_path), "--summary", "--no-prefix"])
+            try:
+                input("\n[done] Press Enter to return to the dashboard… ")
+            except EOFError:
+                pass
+        self._suspend(go)
+        self.trigger_refresh()
+        if self.want_pending:
+            self.trigger_pending()
+
+    def action_log(self):
+        logf = os.path.expanduser(self.cfg.get("LOGFILE", "") or "")
+        if not (logf and os.path.exists(logf)):
+            self.msg = "no log file"
+            return
+        self._suspend(lambda: subprocess.run([os.environ.get("PAGER", "less"), "+G", logf]))
+
+    # main loop --------------------------------------------------------------
+    def loop(self):
+        curses.curs_set(0)
+        self.init_colors()
+        self.stdscr.nodelay(True)
+        self.stdscr.timeout(150)
+        self.trigger_refresh()
+        if self.want_pending:
+            self.trigger_pending()
+        while True:
+            self.spin += 1
+            if not self.refreshing and (time.monotonic() - self.last_refresh) >= self.interval:
+                self.trigger_refresh()
+            self.draw()
+            try:
+                ch = self.stdscr.getch()
+            except KeyboardInterrupt:
+                break
+            if ch == -1:
+                continue
+            self.msg = ""
+            if ch in (ord("q"), ord("Q"), 27):
+                break
+            elif ch in (ord("r"), ord("R")):
+                self.trigger_refresh()
+            elif ch in (ord("c"), ord("C")):
+                self.trigger_pending()
+            elif ch in (ord("s"), ord("S")):
+                self.action_sync()
+            elif ch in (ord("l"), ord("L")):
+                self.action_log()
+            elif ch in (ord("j"), curses.KEY_DOWN):
+                self.scroll += 1
+            elif ch in (ord("k"), curses.KEY_UP):
+                self.scroll -= 1
+            elif ch == curses.KEY_NPAGE:
+                self.scroll += 10
+            elif ch == curses.KEY_PPAGE:
+                self.scroll -= 10
+            elif ch in (ord("g"), curses.KEY_HOME):
+                self.scroll = 0
+            elif ch in (ord("G"), curses.KEY_END):
+                self.scroll = 10 ** 6
+
+
+def run_tui(cfg, tgt, cfg_path, local_only=False, interval=6, want_pending=True):
+    curses.wrapper(lambda scr: TUI(scr, cfg, tgt, cfg_path, local_only, interval, want_pending).loop())
+
+
 def main():
     args = sys.argv[1:]
-    o = {"config": None, "watch": False, "interval": 5, "check": False,
-         "sync": False, "log": False, "local_only": False, "fast": False}
+    o = {"config": None, "watch": False, "interval": 6, "check": False,
+         "sync": False, "log": False, "local_only": False, "fast": False,
+         "print": False}
     passthru = []
     i = 0
     while i < len(args):
@@ -511,6 +871,8 @@ def main():
             i += 1; o["config"] = args[i]
         elif a in ("-w", "--watch"):
             o["watch"] = True
+        elif a in ("-p", "--print", "--once"):
+            o["print"] = True
         elif a in ("-i", "--interval"):
             i += 1; o["interval"] = float(args[i])
         elif a in ("-f", "--fast", "--no-check"):
@@ -543,11 +905,6 @@ def main():
             sys.exit("osync-dash: no log file found")
         return
 
-    if o["sync"]:
-        print(f"{CYAN}▶ running osync {cfg.get('INSTANCE_ID','')}…{RESET}\n")
-        subprocess.run([OSYNC_BIN, str(cfg_path), "--summary", "--no-prefix"] + passthru)
-        print()
-
     def one_shot(pending=False):
         state, local, remote = gather(cfg, tgt, o["local_only"])
         if pending:
@@ -555,20 +912,24 @@ def main():
             state["pending"] = compute_pending(cfg_path)
         return render(cfg, tgt, state, local, remote, term_width())
 
-    if o["watch"]:
-        note = "" if o["check"] else " · pending skipped (--check to force)"
-        try:
-            while True:
-                frame = one_shot(pending=o["check"])
-                sys.stdout.write("\033[H\033[2J" + frame +
-                                 f"\n\n{DIM}↻ every {o['interval']:g}s · Ctrl-C to quit{note} · {time.strftime('%H:%M:%S')}{RESET}\n")
-                sys.stdout.flush()
-                time.sleep(o["interval"])
-        except KeyboardInterrupt:
-            print()
-            return
+    # --sync is a one-off action: run, print the result, exit.
+    if o["sync"]:
+        print(f"{CYAN}▶ running osync {cfg.get('INSTANCE_ID','')}…{RESET}\n")
+        subprocess.run([OSYNC_BIN, str(cfg_path), "--summary", "--no-prefix"] + passthru)
+        print("\n" + one_shot(pending=not o["fast"]))
+        return
 
-    # one-shot default: show everything, including the pending dry-run
+    # Default: the interactive TUI (unless --print, --once, or a non-tty pipe).
+    interactive = not o["print"] and sys.stdout.isatty() and sys.stdin.isatty()
+    if interactive:
+        try:
+            run_tui(cfg, tgt, cfg_path, local_only=o["local_only"],
+                    interval=int(o["interval"]), want_pending=not o["fast"])
+        except KeyboardInterrupt:
+            pass
+        return
+
+    # Non-interactive / --print: one-shot, everything included.
     print(one_shot(pending=(o["check"] or not o["fast"])))
 
 

@@ -41,16 +41,37 @@ ln -s "$PWD/osync-dash/osync-dash" ~/.local/bin/osync-dash   # anywhere on PATH
 
 ## Usage
 
-Just run it — the default view includes everything, pending dry-run included:
+Just run it for the interactive full-screen TUI (auto-refreshing, keyboard-driven):
 
 ```sh
-osync-dash                 # full dashboard for the sole ~/.config/osync/*.conf
+osync-dash                 # interactive TUI for the sole ~/.config/osync/*.conf
 osync-dash -c path.conf    # a specific job
-osync-dash --fast          # skip the pending dry-run (status only, no ssh rsync)
-osync-dash --watch         # live refresh (pending skipped each cycle)
-osync-dash --sync          # run the sync, then show the dashboard
-osync-dash --log           # page the osync log
-osync-dash --local-only    # offline: skip the remote probe
+```
+
+Inside the TUI:
+
+| key | action |
+|-----|--------|
+| `r` | refresh now |
+| `c` | run the pending-changes dry-run |
+| `s` | run the sync (streams osync, returns to the TUI) |
+| `l` | page the osync log |
+| `↑ ↓` `PgUp` `PgDn` `g` `G` | scroll |
+| `q` / `Esc` | quit |
+
+Status refreshes on a background thread every few seconds, so ssh probes never
+freeze input. Terminal resize is handled, and it works fine over SSH.
+
+### Non-interactive
+
+Piped output, or `--print`, falls back to a one-shot render of the same panels:
+
+```sh
+osync-dash --print          # one-shot to stdout (automatic when piped)
+osync-dash --print --fast    # skip the pending dry-run
+osync-dash --sync           # run the sync, print the result, exit
+osync-dash --log            # page the osync log, exit
+osync-dash --local-only     # offline: skip the remote probe
 ```
 
 Configs are auto-discovered in `~/.config/osync/*.conf`; with more than one it
