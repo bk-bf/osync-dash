@@ -1,97 +1,148 @@
 #!/usr/bin/env python3
-"""osync-dash — Textual TUI front-end.
+"""osync-dash — Textual TUI front-end (ayu-themed, btop-inspired).
 
-Launched by the `osync-dash` wrapper under the project virtualenv (Textual is
-the only third-party dependency). All data gathering lives in osync_core; this
-module is purely the interactive presentation layer.
+Launched by the `osync-dash` wrapper under the project virtualenv. All data
+gathering + config management lives in osync_core; this is presentation only.
 """
 from __future__ import annotations
 
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import osync_core as core  # noqa: E402
 
-from rich import box  # noqa: E402
+from rich.console import Group  # noqa: E402
 from rich.table import Table  # noqa: E402
 from rich.text import Text  # noqa: E402
-from textual import work  # noqa: E402
+from textual import on, work  # noqa: E402
 from textual.app import App, ComposeResult  # noqa: E402
-from textual.containers import Horizontal, VerticalScroll  # noqa: E402
-from textual.widgets import Footer, Header, Static  # noqa: E402
+from textual.containers import Grid, Horizontal, Vertical, VerticalScroll  # noqa: E402
+from textual.screen import ModalScreen  # noqa: E402
+from textual.theme import Theme  # noqa: E402
+from textual.widgets import Button, Footer, Header, Input, Label, RadioButton, RadioSet, Static  # noqa: E402
 
-# health colour-name -> Rich colour (used inside Text/Table renderables)
-RC = {"green": "green3", "yellow": "yellow", "red": "red3", "blue": "deep_sky_blue1",
-      "cyan": "cyan", "grey": "grey62", "white": "white", "magenta": "plum2"}
-# health colour-name -> Textual-valid border colour (Textual's CSS parser does
-# NOT accept Rich names like grey50/plum2, so borders use hex).
-BORDER = {"green": "#5fd75f", "yellow": "#d7af5f", "red": "#ff5f5f", "blue": "#5fafff",
-          "cyan": "#5fd7d7", "grey": "#808080", "white": "#d0d0d0", "magenta": "#d787d7"}
+# ── ayu palette (from btop's ayu.theme) ──────────────────────────────────────
+BG, FG = "#0B0E14", "#BFBDB6"
+GOLD, MINT, GREEN = "#E6B450", "#95E6CB", "#4CBF99"
+LAV, TAN, SALMON, BLUE = "#DFBFFF", "#E6B673", "#F28779", "#73D0FF"
+LINE, MUTED, WHITE = "#565B66", "#8A909E", "#E6E4DE"
+
+# health colour-name (core.health) -> ayu hex
+HC = {"green": MINT, "yellow": GOLD, "red": SALMON, "blue": BLUE,
+      "cyan": MINT, "grey": MUTED, "white": FG, "magenta": LAV}
+# per-panel accent
+ACCENT = {"health": GOLD, "devices": MINT, "state": LAV,
+          "paths": TAN, "safety": SALMON, "pending": BLUE}
+
+AYU = Theme(
+    name="ayu", primary=GOLD, secondary=MINT, accent=LAV, foreground=FG,
+    background=BG, surface="#0F141C", panel="#11161F",
+    success=MINT, warning=GOLD, error=SALMON, dark=True,
+    variables={
+        "border": LINE, "border-blurred": LINE,
+        "footer-key-foreground": GOLD, "footer-description-foreground": FG,
+        "block-cursor-foreground": BG, "block-cursor-background": GOLD,
+        "input-selection-background": f"{GOLD} 35%",
+    },
+)
 
 
+# ── helpers ──────────────────────────────────────────────────────────────────
 def _n(v, dash="—"):
     return dash if v is None else str(v)
 
 
-def _hsize(v):
+def _hs(v):
     return core.humansize(v) if v is not None else "—"
+
+
+def _interp(a, b, t):
+    a, b = a.lstrip("#"), b.lstrip("#")
+    ar, ag, ab = int(a[0:2], 16), int(a[2:4], 16), int(a[4:6], 16)
+    br, bg, bb = int(b[0:2], 16), int(b[2:4], 16), int(b[4:6], 16)
+    return f"#{round(ar+(br-ar)*t):02x}{round(ag+(bg-ag)*t):02x}{round(ab+(bb-ab)*t):02x}"
+
+
+def grad_bar(frac, width, c1, c2, bg=LINE) -> Text:
+    """A btop-style gradient meter bar."""
+    frac = max(0.0, min(1.0, frac))
+    filled = int(round(frac * width))
+    t = Text()
+    for i in range(width):
+        if i < filled:
+            t.append("█", style=_interp(c1, c2, i / max(1, width - 1)))
+        else:
+            t.append("─", style=bg)
+    return t
 
 
 # ── renderables ──────────────────────────────────────────────────────────────
 def health_render(cfg, state, local, remote) -> Text:
     st, cname = core.health(state, remote, local)
-    c = RC.get(cname, "white")
+    c = HC.get(cname, FG)
     age = core.human_age(core.time.time() - state["last_ts"] if state["last_ts"] else None)
     stype = cfg.get("SYNC_TYPE", "").strip() or "bidirectional"
     t = Text()
     t.append("● ", style=f"bold {c}")
     t.append(st, style=f"bold {c}")
     if state["running"]:
-        t.append("   sync in progress…", style="deep_sky_blue1")
-    t.append(f"      last sync ", style="grey62")
-    t.append(age, style="white")
-    t.append("      mode ", style="grey62")
-    t.append(stype, style="white")
+        t.append("   ⟳ sync running", style=BLUE)
+    t.append("      last sync ", style=MUTED)
+    t.append(age, style=WHITE)
+    t.append("      mode ", style=MUTED)
+    t.append(stype, style=WHITE)
     return t
 
 
-def devices_render(cfg, tgt, local, remote) -> Table:
-    t = Table(box=box.SIMPLE_HEAD, expand=True, pad_edge=False, show_edge=False)
-    t.add_column("device", justify="left", header_style="grey50")
-    t.add_column("host", justify="left", header_style="grey50", ratio=1)  # absorbs slack
-    t.add_column("up", justify="center", header_style="grey50")
-    t.add_column("rsync", justify="center", header_style="grey50")
-    t.add_column("files", justify="right", header_style="grey50")
-    t.add_column("size", justify="right", header_style="grey50")
-    t.add_column("free", justify="right", header_style="grey50")
+def device_block(role, r, accent) -> Group:
+    reach = r.get("reach", False)
+    host = r.get("host") or (r.get("ts") or {}).get("name") or "—"
+    l1 = Text()
+    l1.append("▎", style=accent)
+    l1.append(f" {role:<9} ", style=f"bold {accent}")
+    l1.append(host, style=f"bold {WHITE}")
+    ts = r.get("ts")
+    if ts and ts.get("name"):
+        l1.append(f"   ↳ {ts['name']}", style=MUTED)
+        if ts.get("ip"):
+            l1.append(f" · {ts['ip']}", style=LINE)
+    l2 = Text("   ")
+    l2.append("● online" if reach else "● offline", style=MINT if reach else SALMON)
+    l2.append("    rsync ", style=MUTED)
+    l2.append("✓" if r.get("rsync") else ("—" if not reach else "✗"), style=MINT if r.get("rsync") else MUTED)
+    if r.get("files") is not None:
+        l2.append(f"    {r['files']} files", style=FG)
+    if r.get("size") is not None:
+        l2.append(f" · {core.humansize(r['size'])}", style=MUTED)
+    rows = [l1, l2]
+    dt, du = r.get("disk_total"), r.get("disk_used")
+    if dt and du is not None and dt > 0:
+        frac = du / dt
+        l3 = Text("   disk ")
+        l3.append("▕", style=LINE)
+        l3.append_text(grad_bar(frac, 22, MINT, GREEN))
+        l3.append("▏", style=LINE)
+        l3.append(f" {frac*100:.0f}%", style=MINT)
+        l3.append(f"   {core.humansize(du)} used · {core.humansize(r.get('free'))} free", style=MUTED)
+        rows.append(l3)
+    return Group(*rows)
 
-    def row(role, r):
-        reach = r.get("reach", False)
-        up = Text("●", style="green3" if reach else "red3")
-        rs = "✓" if r.get("rsync") else ("—" if not reach else "✗")
-        host = r.get("host") or (r.get("ts") or {}).get("name") or "—"
-        hcell = Text(host, style="white")
-        ts = r.get("ts")
-        if ts and ts.get("name"):
-            ip = ts.get("ip") or ""
-            hcell.append(f"\n↳ {ts['name']}" + (f"  ·  {ip}" if ip else ""), style="dim")
-        t.add_row(Text(role, style="cyan"), hcell, up, rs,
-                  _n(r.get("files")), _hsize(r.get("size")), _hsize(r.get("free")))
 
-    row("initiator", local)
-    row("target", remote if tgt.get("remote") else local)
+def devices_render(cfg, tgt, local, remote) -> Group:
+    parts = [device_block("initiator", local, MINT), Text(""),
+             device_block("target", remote if tgt.get("remote") else local, GOLD)]
     if tgt.get("remote") and not remote.get("reach", False):
-        t.add_row(Text("!", style="yellow"),
-                  Text(str(remote.get("err", "unreachable")), style="yellow"), "", "", "", "", "")
-    return t
+        parts.append(Text(f"   ! {remote.get('err', 'unreachable')}", style=SALMON))
+    return Group(*parts)
 
 
 def _kv(rows) -> Table:
     t = Table(box=None, expand=True, show_header=False, pad_edge=False)
-    t.add_column(style="grey62", no_wrap=True, width=13)
-    t.add_column(ratio=1)  # value column absorbs the panel width, keeps key snug
+    t.add_column(style=MUTED, no_wrap=True, width=13)
+    t.add_column(ratio=1)
     for k, v in rows:
         t.add_row(k, v)
     return t
@@ -99,154 +150,254 @@ def _kv(rows) -> Table:
 
 def state_render(cfg, state) -> Table:
     res = state.get("init_action") or "—"
-    rc = "green3" if res == "synced" else ("grey62" if res == "—" else "red3")
+    rc = MINT if res == "synced" else (MUTED if res == "—" else SALMON)
     resume = state.get("resume")
     lastrun = (core.time.strftime("%Y-%m-%d %H:%M", core.time.localtime(state["last_ts"]))
                if state["last_ts"] else "never")
     age = core.human_age(core.time.time() - state["last_ts"] if state["last_ts"] else None)
     ta = state.get("tgt_action")
     result = Text(res, style=rc)
-    result.append("   target: ", style="grey62")
-    result.append(_n(ta), style="green3" if ta == "synced" else "grey62")
-    resume_t = (Text("0 (clean)", style="green3") if resume in ("0", None)
-                else Text(f"{resume} (retried)", style="red3"))
+    result.append("   target ", style=MUTED)
+    result.append(_n(ta), style=MINT if ta == "synced" else MUTED)
     return _kv([
-        ("last run", Text(f"{lastrun}  ({age} ago)", style="white")),
+        ("last run", Text(f"{lastrun}  ({age} ago)", style=WHITE)),
         ("result", result),
-        ("resume", resume_t),
-        ("running", Text("yes", style="deep_sky_blue1") if state["running"] else Text("no", style="grey62")),
+        ("resume", Text("0 clean", style=MINT) if resume in ("0", None) else Text(f"{resume} retried", style=SALMON)),
+        ("running", Text("yes", style=BLUE) if state["running"] else Text("no", style=MUTED)),
     ])
 
 
 def paths_render(cfg, tgt) -> Table:
+    active = core.endpoint_of(core.parse_config(Path(cfg["_configfile"]))) if cfg.get("_configfile") else ""
     tgt_s = (f"{tgt.get('user','')}@{tgt.get('host','')}:{tgt.get('path','?')}"
              if tgt.get("remote") else cfg.get("TARGET_SYNC_DIR", "?"))
+    tgt_t = Text(tgt_s, style=WHITE)
+    if active:
+        tgt_t.append(f"   via {'Tailscale' if active=='ts' else 'plain SSH'}",
+                     style=MINT if active == "ts" else GOLD)
     return _kv([
-        ("initiator", Text(cfg.get("INITIATOR_SYNC_DIR", "?"), style="white")),
-        ("target", Text(tgt_s, style="white")),
-        ("workdir", Text(f"{cfg.get('INITIATOR_SYNC_DIR','')}/{core.OSYNC_DIR}", style="dim")),
-        ("log", Text(cfg.get("LOGFILE", "—") or "—", style="dim")),
-        ("config", Text(cfg.get("_configfile", ""), style="dim")),
+        ("initiator", Text(cfg.get("INITIATOR_SYNC_DIR", "?"), style=WHITE)),
+        ("target", tgt_t),
+        ("workdir", Text(f"{cfg.get('INITIATOR_SYNC_DIR','')}/{core.OSYNC_DIR}", style=MUTED)),
+        ("log", Text(cfg.get("LOGFILE", "—") or "—", style=MUTED)),
+        ("config", Text(cfg.get("_configfile", ""), style=MUTED)),
     ])
 
 
 def safety_render(cfg, tgt, local, remote) -> Table:
-    li = local.get("deleted", 0)
-    ri = remote.get("deleted") if tgt.get("remote") else local.get("deleted")
-    lb = local.get("backup", 0)
-    rb = remote.get("backup") if tgt.get("remote") else local.get("backup")
-    sd_on = cfg.get("SOFT_DELETE", "true") == "true"
-    cb_on = cfg.get("CONFLICT_BACKUP", "true") == "true"
+    li, ri = local.get("deleted", 0), (remote.get("deleted") if tgt.get("remote") else local.get("deleted"))
+    lb, rb = local.get("backup", 0), (remote.get("backup") if tgt.get("remote") else local.get("backup"))
+    sd = cfg.get("SOFT_DELETE", "true") == "true"
+    cb = cfg.get("CONFLICT_BACKUP", "true") == "true"
 
-    def line(on, li, ri, days):
-        t = Text("on  ", style="green3") if on else Text("off ", style="grey62")
-        t.append(f"init {li} / target {_n(ri)}", style="default")
-        t.append(f"   kept {days}d", style="grey62")
+    def ln(on, a, b, days):
+        t = Text("on  ", style=MINT) if on else Text("off ", style=MUTED)
+        t.append(f"init {a} / target {_n(b)}", style=FG)
+        t.append(f"   kept {days}d", style=MUTED)
         return t
 
-    winner = Text("newest mtime", style="green3")
-    winner.append(f"   · tie → {cfg.get('CONFLICT_PREVALANCE','initiator')} (same-timestamp only)", style="grey62")
-    rows = [
-        ("soft-delete", line(sd_on, li, ri, cfg.get("SOFT_DELETE_DAYS", "?"))),
-        ("conflict-bkp", line(cb_on, lb, rb, cfg.get("CONFLICT_BACKUP_DAYS", "?"))),
-        ("winner", winner),
-    ]
+    winner = Text("newest mtime", style=MINT)
+    winner.append(f"   · tie → {cfg.get('CONFLICT_PREVALANCE','initiator')}", style=MUTED)
+    rows = [("soft-delete", ln(sd, li, ri, cfg.get("SOFT_DELETE_DAYS", "?"))),
+            ("conflict-bkp", ln(cb, lb, rb, cfg.get("CONFLICT_BACKUP_DAYS", "?"))),
+            ("winner", winner)]
     excl = cfg.get("RSYNC_EXCLUDE_PATTERN", "").strip()
     if excl:
-        rows.append(("excludes", Text(excl, style="yellow")))
+        rows.append(("excludes", Text(excl, style=GOLD)))
     return _kv(rows)
 
 
 def pending_render(pending, running) -> Text:
     if running:
-        return Text("computing dry-run…", style="grey62")
+        return Text("⟳ computing dry-run…", style=MUTED)
     if pending is None:
-        t = Text("press ", style="grey62")
-        t.append("c", style="white")
-        t.append(" to check for pending changes", style="grey62")
+        t = Text("press ", style=MUTED)
+        t.append("c", style=f"bold {GOLD}")
+        t.append(" to check for pending changes", style=MUTED)
         return t
     if pending["total"] == 0:
-        return Text("in sync — nothing pending", style="green3")
-    t = Text(f"{pending['total']} pending", style="yellow")
-    t.append(f"    →target {pending['tu']}u/{pending['td']}d", style="grey62")
-    t.append(f"    →init {pending['iu']}u/{pending['id']}d", style="grey62")
+        return Text("✓ in sync — nothing pending", style=MINT)
+    t = Text(f"⚠ {pending['total']} pending", style=GOLD)
+    t.append(f"     →target {pending['tu']}u / {pending['td']}d", style=MUTED)
+    t.append(f"     →init {pending['iu']}u / {pending['id']}d", style=MUTED)
     return t
 
 
 # ── panel widget ─────────────────────────────────────────────────────────────
 class Panel(Static):
-    """A titled, bordered box that renders a Rich renderable."""
-
-    def __init__(self, title: str, pid: str, border: str = "grey50"):
+    def __init__(self, title, pid, accent):
         super().__init__(id=pid)
-        self.border_title = title
-        self.styles.border = ("round", border)
-        self.styles.padding = (0, 1)
+        self.border_title = f" {title} "
+        self._accent = accent
 
-    def set_border(self, color: str):
+    def on_mount(self):
+        self.set_accent(self._accent)
+
+    def set_accent(self, color):
+        self._accent = color
         self.styles.border = ("round", color)
+        self.styles.border_title_color = color
+
+
+# ── add-host modal ───────────────────────────────────────────────────────────
+class AddHost(ModalScreen):
+    CSS = """
+    AddHost { align: center middle; }
+    #box { width: 74; height: auto; padding: 1 2; background: $panel;
+           border: round $primary; }
+    #box .h { color: $primary; text-style: bold; margin-bottom: 1; }
+    #box Label { color: $foreground-muted; margin-top: 1; }
+    #box Input { border: tall $panel-lighten-2; }
+    #box RadioSet { border: none; height: auto; layout: horizontal; margin-top: 1; }
+    #err { color: $error; height: auto; }
+    #btns { height: auto; align-horizontal: right; margin-top: 1; }
+    #btns Button { margin-left: 2; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, ts_devices):
+        super().__init__()
+        self.ts_devices = ts_devices
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="box"):
+            yield Static("＋ add a sync host", classes="h")
+            yield Label("name (used for the config filename)")
+            yield Input(placeholder="e.g. desktop, nas, vps", id="i_name")
+            yield Label("local (initiator) directory")
+            yield Input(value=os.path.expanduser("~/"), id="i_init")
+            yield Label("remote user  ·  remote path")
+            with Horizontal():
+                yield Input(placeholder="ubuntu", id="i_user")
+                yield Input(placeholder="/home/ubuntu/sync", id="i_path")
+            hint = ("Tailscale host: MagicDNS name, tailnet IP, or an ssh alias.  "
+                    + ("seen: " + ", ".join(self.ts_devices[:4]) if self.ts_devices else ""))
+            yield Label(hint)
+            with Horizontal():
+                yield Input(placeholder="ubuntu / host.tailXXXX.ts.net", id="i_ts")
+                yield Input(value="22", id="i_tsport")
+            yield Label("plain-SSH host (LAN/public)  ·  port")
+            with Horizontal():
+                yield Input(placeholder="192.168.1.50 / host.example.com", id="i_ssh")
+                yield Input(value="22", id="i_sshport")
+            yield Label("ssh identity key")
+            yield Input(value=os.path.expanduser("~/.ssh/id_ed25519"), id="i_key")
+            yield Label("reach it via")
+            with RadioSet(id="i_active"):
+                yield RadioButton("Tailscale", value=True, id="rb_ts")
+                yield RadioButton("Plain SSH", id="rb_ssh")
+            yield Static("", id="err")
+            with Horizontal(id="btns"):
+                yield Button("Cancel", id="cancel")
+                yield Button("Create", variant="primary", id="create")
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#cancel")
+    def _cancel(self):
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#create")
+    def _create(self):
+        g = lambda i: self.query_one(f"#{i}", Input).value.strip()
+        name, init, user, path = g("i_name"), g("i_init"), g("i_user"), g("i_path")
+        ts_host, ssh_host = g("i_ts"), g("i_ssh")
+        active = "ts" if self.query_one("#i_active", RadioSet).pressed_index == 0 else "ssh"
+        err = self.query_one("#err", Static)
+        missing = [n for n, v in (("name", name), ("local dir", init), ("user", user), ("path", path)) if not v]
+        if missing:
+            err.update(f"missing: {', '.join(missing)}"); return
+        if active == "ts" and not ts_host:
+            err.update("Tailscale selected but no Tailscale host given"); return
+        if active == "ssh" and not ssh_host:
+            err.update("Plain SSH selected but no SSH host given"); return
+        try:
+            p = core.create_config(
+                instance=name, initiator_dir=init, user=user, path=path, key=g("i_key"),
+                ts_host=ts_host, ts_port=g("i_tsport") or "22",
+                ssh_host=ssh_host, ssh_port=g("i_sshport") or "22", active=active)
+        except FileExistsError as e:
+            err.update(str(e)); return
+        except Exception as e:  # noqa: BLE001
+            err.update(f"error: {e}"); return
+        self.dismiss(p)
 
 
 # ── app ──────────────────────────────────────────────────────────────────────
 class OsyncDash(App):
     CSS = """
-    Screen { background: $surface; }
-    #grid { height: auto; }
+    Screen { background: $background; }
+    #grid { height: auto; padding: 0 1; }
     .row { height: auto; }
-    Panel { height: auto; margin: 0 1 1 1; }
-    #p_health { margin-top: 1; }
+    Panel { height: auto; margin: 0 1 1 1; padding: 0 1; background: $panel; }
+    #p_health { margin: 1 1 1 1; }
     #p_devices { width: 3fr; }
     #p_state   { width: 2fr; }
-    #p_paths   { width: 1fr; }
-    #p_safety  { width: 1fr; }
+    #p_paths, #p_safety { width: 1fr; }
     """
     BINDINGS = [
         ("r", "refresh", "Refresh"),
-        ("c", "check", "Check pending"),
-        ("s", "sync", "Sync now"),
+        ("c", "check", "Check"),
+        ("s", "sync", "Sync"),
+        ("t", "toggle_endpoint", "TS/SSH"),
+        ("n", "next_host", "Host"),
+        ("a", "add_host", "Add"),
         ("l", "log", "Log"),
         ("q", "quit", "Quit"),
     ]
 
-    def __init__(self, cfg, tgt, cfg_path, local_only=False, interval=6, want_pending=True):
+    def __init__(self, cfg_path, local_only=False, interval=6, want_pending=True):
         super().__init__()
-        self.cfg, self.tgt, self.cfg_path = cfg, tgt, cfg_path
+        self.configs = core.list_configs()
+        self.cfg_path = Path(cfg_path)
+        if self.cfg_path not in self.configs and self.cfg_path.exists():
+            self.configs.append(self.cfg_path)
         self.local_only = local_only
         self.interval = max(2, interval)
         self.want_pending = want_pending
         self.data = None
         self.pending = None
         self.pending_running = False
-        self.title = f"osync-dash · {cfg.get('INSTANCE_ID', '?')}"
+        self._load_cfg()
+
+    def _load_cfg(self):
+        self.cfg, self.tgt = core.load(self.cfg_path)
+        self.title = "osync-dash"
+        active = self.cfg.get("DASH_ACTIVE", "")
+        via = {"ts": " · Tailscale", "ssh": " · plain SSH"}.get(active, "")
+        self.sub_title = f"{self.cfg.get('INSTANCE_ID','?')}{via}"
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with VerticalScroll(id="grid"):
-            yield Panel("health", "p_health", BORDER["cyan"])
+            yield Panel("health", "p_health", GOLD)
             with Horizontal(classes="row"):
-                yield Panel("devices", "p_devices", BORDER["grey"])
-                yield Panel("sync state", "p_state", BORDER["cyan"])
+                yield Panel("devices", "p_devices", MINT)
+                yield Panel("sync state", "p_state", LAV)
             with Horizontal(classes="row"):
-                yield Panel("paths", "p_paths", BORDER["cyan"])
-                yield Panel("safety net", "p_safety", BORDER["magenta"])
-            yield Panel("pending (dry-run)", "p_pending", BORDER["grey"])
+                yield Panel("paths", "p_paths", TAN)
+                yield Panel("safety net", "p_safety", SALMON)
+            yield Panel("pending", "p_pending", BLUE)
         yield Footer()
 
     def on_mount(self):
+        self.register_theme(AYU)
+        self.theme = "ayu"
         for pid in ("p_health", "p_devices", "p_state", "p_paths", "p_safety"):
-            self.query_one(f"#{pid}", Panel).update(Text("gathering…", style="grey62"))
+            self.query_one(f"#{pid}", Panel).update(Text("gathering…", style=MUTED))
         self.query_one("#p_pending", Panel).update(pending_render(None, False))
         self.refresh_data()
         if self.want_pending:
             self.check_pending()
         self.set_interval(self.interval, self.refresh_data)
 
-    # workers (threaded so ssh never blocks the UI) ------------------------
+    # workers -------------------------------------------------------------
     @work(thread=True, exclusive=True, group="refresh")
     def refresh_data(self):
         try:
             data = core.gather(self.cfg, self.tgt, self.local_only)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             self.call_from_thread(self.notify, f"refresh failed: {e}", severity="error")
             return
         self.call_from_thread(self._apply, data)
@@ -257,36 +408,33 @@ class OsyncDash(App):
         self.call_from_thread(self._apply_pending)
         try:
             p = core.compute_pending(self.cfg_path)
-        except Exception as e:
+        except Exception:  # noqa: BLE001
             p = None
-            self.call_from_thread(self.notify, f"check failed: {e}", severity="error")
         self.pending_running = False
         self.pending = p
         self.call_from_thread(self._apply_pending)
 
-    # UI updates (main thread) ---------------------------------------------
+    # ui updates ----------------------------------------------------------
     def _apply(self, data):
         self.data = data
         state, local, remote = data
         _, cname = core.health(state, remote, local)
-        p = self.query_one("#p_health", Panel)
-        p.set_border(BORDER.get(cname, "#d0d0d0"))
-        p.update(health_render(self.cfg, state, local, remote))
+        h = self.query_one("#p_health", Panel)
+        h.set_accent(HC.get(cname, FG))
+        h.update(health_render(self.cfg, state, local, remote))
         self.query_one("#p_devices", Panel).update(devices_render(self.cfg, self.tgt, local, remote))
         self.query_one("#p_state", Panel).update(state_render(self.cfg, state))
         self.query_one("#p_paths", Panel).update(paths_render(self.cfg, self.tgt))
         self.query_one("#p_safety", Panel).update(safety_render(self.cfg, self.tgt, local, remote))
-        self.sub_title = "refreshed"
 
     def _apply_pending(self):
         p = self.query_one("#p_pending", Panel)
         p.update(pending_render(self.pending, self.pending_running))
         if not self.pending_running and self.pending is not None:
-            p.set_border(BORDER["green"] if self.pending["total"] == 0 else BORDER["yellow"])
+            p.set_accent(MINT if self.pending["total"] == 0 else GOLD)
 
-    # actions ---------------------------------------------------------------
+    # actions -------------------------------------------------------------
     def action_refresh(self):
-        self.sub_title = "refreshing…"
         self.refresh_data()
 
     def action_check(self):
@@ -295,7 +443,7 @@ class OsyncDash(App):
     def action_sync(self):
         with self.suspend():
             os.system("clear")
-            print("\033[36m▶ Running osync sync…\033[0m\n")
+            print(f"\033[38;2;230;180;80m▶ Running osync — {self.cfg.get('INSTANCE_ID','')}\033[0m\n")
             subprocess.run([core.OSYNC_BIN, str(self.cfg_path), "--summary", "--no-prefix"])
             try:
                 input("\n[done] Press Enter to return… ")
@@ -312,6 +460,47 @@ class OsyncDash(App):
             return
         with self.suspend():
             subprocess.run([os.environ.get("PAGER", "less"), "+G", logf])
+
+    def action_toggle_endpoint(self):
+        new, msg = core.toggle_endpoint(self.cfg_path)
+        if not new:
+            self.notify(msg, severity="warning")
+            return
+        self._load_cfg()
+        self.notify(msg, severity="information")
+        self.refresh_data()
+
+    def action_next_host(self):
+        self.configs = core.list_configs() or self.configs
+        if len(self.configs) < 2:
+            self.notify("only one host — press 'a' to add another", severity="information")
+            return
+        i = (self.configs.index(self.cfg_path) + 1) % len(self.configs) if self.cfg_path in self.configs else 0
+        self.cfg_path = self.configs[i]
+        self._load_cfg()
+        self.notify(f"→ {self.cfg.get('INSTANCE_ID','?')}")
+        self.refresh_data()
+        if self.want_pending:
+            self.check_pending()
+
+    def action_add_host(self):
+        devices = []
+        ts = core.tailscale_map()
+        for v in ts.values():
+            if v.get("name") and v["name"] not in devices:
+                devices.append(v["name"])
+        self.push_screen(AddHost(sorted(devices)), self._added)
+
+    def _added(self, path):
+        if not path:
+            return
+        self.configs = core.list_configs()
+        self.cfg_path = Path(path)
+        self._load_cfg()
+        self.notify(f"created host '{self.cfg.get('INSTANCE_ID','?')}'", severity="information")
+        self.refresh_data()
+        if self.want_pending:
+            self.check_pending()
 
 
 def parse_args(argv):
@@ -334,9 +523,8 @@ def parse_args(argv):
 def main():
     o = parse_args(sys.argv[1:])
     cfg_path = core.pick_config(o["config"])
-    cfg, tgt = core.load(cfg_path)
-    OsyncDash(cfg, tgt, cfg_path, local_only=o["local_only"],
-              interval=o["interval"], want_pending=not o["fast"]).run()
+    OsyncDash(cfg_path, local_only=o["local_only"], interval=o["interval"],
+              want_pending=not o["fast"]).run()
 
 
 if __name__ == "__main__":

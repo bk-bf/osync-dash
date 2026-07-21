@@ -65,11 +65,24 @@ In the TUI:
 | `r` | refresh now |
 | `c` | run the pending-changes dry-run |
 | `s` | run the sync (suspends to stream osync, then returns) |
+| `t` | toggle the target between its Tailscale and plain-SSH endpoint |
+| `n` | switch to the next host (cycles configs in `~/.config/osync`) |
+| `a` | add a new host (opens a form, writes a new config) |
 | `l` | page the osync log |
 | `q` | quit |
 
 Status refreshes on a background thread, so ssh probes never freeze the UI.
-Resize and mouse work; it's fine over SSH.
+Resize and mouse work; it's fine over SSH. The theme follows btop's **ayu**
+palette, with gradient disk meters per replica.
+
+## Multiple hosts · Tailscale ⇄ plain SSH
+
+Each osync job in `~/.config/osync/*.conf` is a "host"; cycle them with `n`.
+Press `a` to add one via a form — name, local dir, remote user/path, an ssh
+key, and **both** a Tailscale host and a plain-SSH host. osync-dash stores both
+endpoints in the config (`DASH_*` keys osync ignores) and `t` flips
+`TARGET_SYNC_DIR` between them live — Tailscale when you're roaming, LAN/direct
+SSH when you're on the same network.
 
 ### Non-interactive
 
