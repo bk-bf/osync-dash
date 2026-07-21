@@ -2,7 +2,7 @@
 
 An interactive terminal dashboard for [osync](https://github.com/deajan/osync)
 two-way sync jobs, built with [Textual](https://github.com/Textualize/textual).
-One view shows the whole picture: health, both replicas (local + remote over
+One view shows the whole picture: health, both machines (local + remote over
 SSH, with hostnames and Tailscale identity), paths, the soft-delete/backup
 safety net, and a live pending-changes dry-run.
 
@@ -12,9 +12,9 @@ safety net, and a live pending-changes dry-run.
 ╰────────────────────────────────────────────────────────────────────────────╯
 ╭─ devices ──────────────────────────────────────────────────────────────────╮
 │ device      host                              up   rsync   files  size  free│
-│ initiator   my-laptop                         ●     ✓       350   235M  300G│
+│ local      my-laptop                         ●     ✓       350   235M  300G│
 │             ↳ my-laptop  ·  100.x.y.z                                       │
-│ target      my-server                         ●     ✓       350   235M  534G│
+│ remote     my-server                         ●     ✓       350   235M  534G│
 │             ↳ my-server  ·  100.a.b.c                                       │
 ╰────────────────────────────────────────────────────────────────────────────╯
   + sync state · paths · safety net · pending — all live, keyboard-driven
@@ -73,7 +73,7 @@ In the TUI:
 
 Status refreshes on a background thread, so ssh probes never freeze the UI.
 Resize and mouse work; it's fine over SSH. The theme follows btop's **ayu**
-palette, with gradient disk meters per replica.
+palette, with gradient disk meters per machine.
 
 ## Multiple hosts · Tailscale ⇄ plain SSH
 

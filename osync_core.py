@@ -386,9 +386,9 @@ def render(cfg, tgt, state, local, remote, width) -> str:
 
     tgt_dev = remote if tgt.get("remote") else local
     hdr = f"{GREY}{pad('  device', 30)}{pad('up', 4)}{pad('rsync', 8)}{pad('files', 8)}{pad('size', 9)}free{RESET}"
-    drows = [hdr] + dev_lines("initiator", local) + dev_lines("target", tgt_dev)
+    drows = [hdr] + dev_lines("local", local) + dev_lines("remote", tgt_dev)
     if tgt.get("remote") and not remote.get("reach", False):
-        drows.append(f"{YELLOW}  ! target: {remote.get('err', 'unreachable')}{RESET}")
+        drows.append(f"{YELLOW}  ! remote: {remote.get('err', 'unreachable')}{RESET}")
     lines += box("devices", drows, width, GREY)
     lines.append("")
 
@@ -400,7 +400,7 @@ def render(cfg, tgt, state, local, remote, width) -> str:
     lastrun = time.strftime("%Y-%m-%d %H:%M", time.localtime(state["last_ts"])) if state["last_ts"] else "never"
     srows = [
         kv("last run", f"{WHITE}{lastrun}{RESET}  {GREY}({age} ago){RESET}"),
-        kv("result", f"{res_c}{res}{RESET}   target: {res_c if state.get('tgt_action')=='synced' else GREY}{state.get('tgt_action') or '—'}{RESET}"),
+        kv("result", f"{res_c}{res}{RESET}   remote: {res_c if state.get('tgt_action')=='synced' else GREY}{state.get('tgt_action') or '—'}{RESET}"),
         kv("resume", resume_txt),
         kv("running", f"{BLUE}yes{RESET}" if state["running"] else f"{GREY}no{RESET}"),
     ]
@@ -409,8 +409,8 @@ def render(cfg, tgt, state, local, remote, width) -> str:
 
     # paths
     prows = [
-        kv("initiator", f"{WHITE}{cfg.get('INITIATOR_SYNC_DIR','?')}{RESET}", 11),
-        kv("target", f"{WHITE}{tgt.get('user','')}@{tgt.get('host','')}:{tgt.get('path','?')}{RESET}" if tgt.get("remote") else cfg.get("TARGET_SYNC_DIR", "?"), 11),
+        kv("local", f"{WHITE}{cfg.get('INITIATOR_SYNC_DIR','?')}{RESET}", 11),
+        kv("remote", f"{WHITE}{tgt.get('user','')}@{tgt.get('host','')}:{tgt.get('path','?')}{RESET}" if tgt.get("remote") else cfg.get("TARGET_SYNC_DIR", "?"), 11),
         kv("workdir", f"{DIM}{cfg.get('INITIATOR_SYNC_DIR','')}/{OSYNC_DIR}{RESET}", 11),
         kv("log", f"{DIM}{cfg.get('LOGFILE','—') or '—'}{RESET}", 11),
         kv("config", f"{DIM}{cfg.get('_configfile','')}{RESET}", 11),
@@ -427,10 +427,10 @@ def render(cfg, tgt, state, local, remote, width) -> str:
     cb_on = cfg.get("CONFLICT_BACKUP", "true") == "true"
     netrows = [
         kv("soft-delete", (f"{GREEN}on{RESET}" if sd_on else f"{GREY}off{RESET}") +
-           f"   init {WHITE}{li}{RESET} / target {WHITE}{ri if ri is not None else '—'}{RESET}   {GREY}kept {sd_days}d{RESET}", 14),
+           f"   local {WHITE}{li}{RESET} / remote {WHITE}{ri if ri is not None else '—'}{RESET}   {GREY}kept {sd_days}d{RESET}", 14),
         kv("conflict-bkp", (f"{GREEN}on{RESET}" if cb_on else f"{GREY}off{RESET}") +
-           f"   init {WHITE}{lb}{RESET} / target {WHITE}{rb if rb is not None else '—'}{RESET}   {GREY}kept {cb_days}d{RESET}", 14),
-        kv("winner", f"{GREEN}newest mtime{RESET}   {GREY}· tie → {cfg.get('CONFLICT_PREVALANCE','initiator')} (same-timestamp only){RESET}", 14),
+           f"   local {WHITE}{lb}{RESET} / remote {WHITE}{rb if rb is not None else '—'}{RESET}   {GREY}kept {cb_days}d{RESET}", 14),
+        kv("winner", f"{GREEN}newest edit{RESET}   {GREY}· tie → {'local' if cfg.get('CONFLICT_PREVALANCE')=='initiator' else 'remote'} (same-timestamp only){RESET}", 14),
     ]
     excl = cfg.get("RSYNC_EXCLUDE_PATTERN", "").strip()
     if excl:
@@ -444,7 +444,7 @@ def render(cfg, tgt, state, local, remote, width) -> str:
         prc = GREEN if p["total"] == 0 else YELLOW
         txt = (f"{GREEN}in sync — nothing pending{RESET}" if p["total"] == 0 else
                f"{YELLOW}{p['total']} pending{RESET}  "
-               f"{GREY}→target{RESET} {p['tu']}u/{p['td']}d  {GREY}→init{RESET} {p['iu']}u/{p['id']}d")
+               f"{GREY}↑ to remote{RESET} {p['tu']}u/{p['td']}d  {GREY}↓ to local{RESET} {p['iu']}u/{p['id']}d")
         lines += box("pending (dry-run)", [txt], width, prc)
 
     return "\n".join(lines)

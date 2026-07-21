@@ -22,7 +22,9 @@ from textual.app import App, ComposeResult  # noqa: E402
 from textual.containers import Grid, Horizontal, Vertical, VerticalScroll  # noqa: E402
 from textual.screen import ModalScreen  # noqa: E402
 from textual.theme import Theme  # noqa: E402
-from textual.widgets import Button, Footer, Header, Input, Label, RadioButton, RadioSet, Static  # noqa: E402
+from textual.widgets import (Button, Footer, Header, Input, Label, OptionList,  # noqa: E402
+                             RadioButton, RadioSet, Static)
+from textual.widgets.option_list import Option  # noqa: E402
 
 # ── ayu palette (from btop's ayu.theme) ──────────────────────────────────────
 BG, FG = "#0B0E14", "#BFBDB6"
@@ -36,6 +38,8 @@ HC = {"green": MINT, "yellow": GOLD, "red": SALMON, "blue": BLUE,
 # per-panel accent
 ACCENT = {"health": GOLD, "devices": MINT, "state": LAV,
           "paths": TAN, "safety": SALMON, "pending": BLUE}
+# osync's internal role names -> friendly local/remote (GitHub/Dropbox style)
+ROLE = {"initiator": "local", "target": "remote"}
 
 AYU = Theme(
     name="ayu", primary=GOLD, secondary=MINT, accent=LAV, foreground=FG,
@@ -132,8 +136,8 @@ def device_block(role, r, accent) -> Group:
 
 
 def devices_render(cfg, tgt, local, remote) -> Group:
-    parts = [device_block("initiator", local, MINT), Text(""),
-             device_block("target", remote if tgt.get("remote") else local, GOLD)]
+    parts = [device_block("local", local, MINT), Text(""),
+             device_block("remote", remote if tgt.get("remote") else local, GOLD)]
     if tgt.get("remote") and not remote.get("reach", False):
         parts.append(Text(f"   ! {remote.get('err', 'unreachable')}", style=SALMON))
     return Group(*parts)
@@ -157,7 +161,7 @@ def state_render(cfg, state) -> Table:
     age = core.human_age(core.time.time() - state["last_ts"] if state["last_ts"] else None)
     ta = state.get("tgt_action")
     result = Text(res, style=rc)
-    result.append("   target ", style=MUTED)
+    result.append("   remote ", style=MUTED)
     result.append(_n(ta), style=MINT if ta == "synced" else MUTED)
     return _kv([
         ("last run", Text(f"{lastrun}  ({age} ago)", style=WHITE)),
@@ -176,8 +180,8 @@ def paths_render(cfg, tgt) -> Table:
         tgt_t.append(f"   via {'Tailscale' if active=='ts' else 'plain SSH'}",
                      style=MINT if active == "ts" else GOLD)
     return _kv([
-        ("initiator", Text(cfg.get("INITIATOR_SYNC_DIR", "?"), style=WHITE)),
-        ("target", tgt_t),
+        ("local", Text(cfg.get("INITIATOR_SYNC_DIR", "?"), style=WHITE)),
+        ("remote", tgt_t),
         ("workdir", Text(f"{cfg.get('INITIATOR_SYNC_DIR','')}/{core.OSYNC_DIR}", style=MUTED)),
         ("log", Text(cfg.get("LOGFILE", "—") or "—", style=MUTED)),
         ("config", Text(cfg.get("_configfile", ""), style=MUTED)),
@@ -192,12 +196,12 @@ def safety_render(cfg, tgt, local, remote) -> Table:
 
     def ln(on, a, b, days):
         t = Text("on  ", style=MINT) if on else Text("off ", style=MUTED)
-        t.append(f"init {a} / target {_n(b)}", style=FG)
+        t.append(f"local {a} / remote {_n(b)}", style=FG)
         t.append(f"   kept {days}d", style=MUTED)
         return t
 
-    winner = Text("newest mtime", style=MINT)
-    winner.append(f"   · tie → {cfg.get('CONFLICT_PREVALANCE','initiator')}", style=MUTED)
+    winner = Text("newest edit", style=MINT)
+    winner.append(f"   · tie → {ROLE.get(cfg.get('CONFLICT_PREVALANCE',''), 'local')}", style=MUTED)
     rows = [("soft-delete", ln(sd, li, ri, cfg.get("SOFT_DELETE_DAYS", "?"))),
             ("conflict-bkp", ln(cb, lb, rb, cfg.get("CONFLICT_BACKUP_DAYS", "?"))),
             ("winner", winner)]
@@ -218,8 +222,8 @@ def pending_render(pending, running) -> Text:
     if pending["total"] == 0:
         return Text("✓ in sync — nothing pending", style=MINT)
     t = Text(f"⚠ {pending['total']} pending", style=GOLD)
-    t.append(f"     →target {pending['tu']}u / {pending['td']}d", style=MUTED)
-    t.append(f"     →init {pending['iu']}u / {pending['id']}d", style=MUTED)
+    t.append(f"     ↑ to remote {pending['tu']}u / {pending['td']}d", style=MUTED)
+    t.append(f"     ↓ to local {pending['iu']}u / {pending['id']}d", style=MUTED)
     return t
 
 
@@ -239,10 +243,66 @@ class Panel(Static):
         self.styles.border_title_color = color
 
 
+# ── host-switch popup ────────────────────────────────────────────────────────
+class HostPicker(ModalScreen):
+    """A floating list of hosts; the dashboard stays visible (dimmed) behind."""
+
+    CSS = """
+    HostPicker { align: center middle; background: $background 55%; }
+    #hp { width: 56; height: auto; max-height: 80%; padding: 1 2;
+          background: $panel; border: round $secondary; }
+    #hp .h { color: $secondary; text-style: bold; margin-bottom: 1; }
+    #hp .hint { color: $foreground-muted; margin-top: 1; }
+    OptionList { border: none; background: $panel; height: auto; max-height: 18; padding: 0; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel"), ("a", "add", "Add host")]
+
+    def __init__(self, configs, current):
+        super().__init__()
+        self.configs = configs
+        self.current = current
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="hp"):
+            yield Static("⇅ switch host", classes="h")
+            opts = []
+            for p in self.configs:
+                c = core.parse_config(p)
+                name = c.get("INSTANCE_ID", p.stem)
+                via = {"ts": "tailscale", "ssh": "ssh"}.get(c.get("DASH_ACTIVE", ""), "")
+                t = Text("● " if p == self.current else "  ",
+                         style=MINT if p == self.current else MUTED)
+                t.append(name, style=f"bold {WHITE}" if p == self.current else FG)
+                if via:
+                    t.append(f"   {via}", style=MUTED)
+                opts.append(Option(t, id=str(p)))
+            ol = OptionList(*opts, id="ol")
+            yield ol
+            yield Static("↑↓ move · enter switch · a add · esc close", classes="hint")
+
+    def on_mount(self):
+        ol = self.query_one("#ol", OptionList)
+        try:
+            ol.highlighted = next(i for i, p in enumerate(self.configs) if p == self.current)
+        except StopIteration:
+            pass
+        ol.focus()
+
+    @on(OptionList.OptionSelected)
+    def _picked(self, event: OptionList.OptionSelected):
+        self.dismiss(Path(event.option.id))
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+    def action_add(self):
+        self.dismiss("__add__")
+
+
 # ── add-host modal ───────────────────────────────────────────────────────────
 class AddHost(ModalScreen):
     CSS = """
-    AddHost { align: center middle; }
+    AddHost { align: center middle; background: $background 55%; }
     #box { width: 74; height: auto; padding: 1 2; background: $panel;
            border: round $primary; }
     #box .h { color: $primary; text-style: bold; margin-bottom: 1; }
@@ -264,7 +324,7 @@ class AddHost(ModalScreen):
             yield Static("＋ add a sync host", classes="h")
             yield Label("name (used for the config filename)")
             yield Input(placeholder="e.g. desktop, nas, vps", id="i_name")
-            yield Label("local (initiator) directory")
+            yield Label("local directory (this machine)")
             yield Input(value=os.path.expanduser("~/"), id="i_init")
             yield Label("remote user  ·  remote path")
             with Horizontal():
@@ -470,23 +530,31 @@ class OsyncDash(App):
         self.notify(msg, severity="information")
         self.refresh_data()
 
-    def action_next_host(self):
-        self.configs = core.list_configs() or self.configs
-        if len(self.configs) < 2:
-            self.notify("only one host — press 'a' to add another", severity="information")
-            return
-        i = (self.configs.index(self.cfg_path) + 1) % len(self.configs) if self.cfg_path in self.configs else 0
-        self.cfg_path = self.configs[i]
+    def _switch_to(self, path, msg=None):
+        self.cfg_path = Path(path)
         self._load_cfg()
-        self.notify(f"→ {self.cfg.get('INSTANCE_ID','?')}")
+        if msg:
+            self.notify(msg, severity="information")
         self.refresh_data()
         if self.want_pending:
             self.check_pending()
 
+    def action_next_host(self):
+        self.configs = core.list_configs() or self.configs
+        self.push_screen(HostPicker(self.configs, self.cfg_path), self._picked_host)
+
+    def _picked_host(self, result):
+        if result is None:
+            return
+        if result == "__add__":
+            self.action_add_host()
+            return
+        if Path(result) != self.cfg_path:
+            self._switch_to(result, f"→ {core.parse_config(Path(result)).get('INSTANCE_ID','?')}")
+
     def action_add_host(self):
         devices = []
-        ts = core.tailscale_map()
-        for v in ts.values():
+        for v in core.tailscale_map().values():
             if v.get("name") and v["name"] not in devices:
                 devices.append(v["name"])
         self.push_screen(AddHost(sorted(devices)), self._added)
@@ -495,12 +563,7 @@ class OsyncDash(App):
         if not path:
             return
         self.configs = core.list_configs()
-        self.cfg_path = Path(path)
-        self._load_cfg()
-        self.notify(f"created host '{self.cfg.get('INSTANCE_ID','?')}'", severity="information")
-        self.refresh_data()
-        if self.want_pending:
-            self.check_pending()
+        self._switch_to(path, f"created host '{core.parse_config(Path(path)).get('INSTANCE_ID','?')}'")
 
 
 def parse_args(argv):
