@@ -65,9 +65,9 @@ In the TUI:
 | `r` | refresh now |
 | `c` | run the pending-changes dry-run |
 | `s` | run the sync (suspends to stream osync, then returns) |
-| `t` | toggle the target between its Tailscale and plain-SSH endpoint |
-| `n` | switch to the next host (cycles configs in `~/.config/osync`) |
-| `a` | add a new host (opens a form, writes a new config) |
+| `t` | toggle the remote between its Tailscale and plain-SSH endpoint |
+| `n` | open the host switcher (floating popup; dashboard stays visible behind) |
+| `a` | add a new host (floating form, writes a new config) |
 | `l` | page the osync log |
 | `q` | quit |
 
