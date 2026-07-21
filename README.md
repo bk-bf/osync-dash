@@ -1,93 +1,97 @@
 # osync-dash
 
-A dependency-free terminal dashboard for [osync](https://github.com/deajan/osync)
-two-way sync jobs. One command shows the whole picture: health, both replicas
-(local + remote over SSH), paths, the soft-delete/backup safety net, and a live
-pending-changes dry-run.
+An interactive terminal dashboard for [osync](https://github.com/deajan/osync)
+two-way sync jobs, built with [Textual](https://github.com/Textualize/textual).
+One view shows the whole picture: health, both replicas (local + remote over
+SSH, with hostnames and Tailscale identity), paths, the soft-delete/backup
+safety net, and a live pending-changes dry-run.
 
 ```
-╭─ osync · documents_remote ───────────────────────────────╮
-│ ● HEALTHY    last sync 2m   mode bidirectional           │
-╰──────────────────────────────────────────────────────────╯
-╭─ devices ────────────────────────────────────────────────╮
-│   device               up  rsync  files  size   free      │
-│ ▸ initiator my-laptop  ●   ✓      350    235M   300G      │
-│   ↳ tailscale my-laptop  ·  100.x.y.z                     │
-│ ▸ target    my-server  ●   ✓      350    235M   534G      │
-│   ↳ tailscale my-server  ·  100.a.b.c                     │
-╰──────────────────────────────────────────────────────────╯
-  + sync state · paths · safety net · pending (dry-run)
+╭─ health ───────────────────────────────────────────────────────────────────╮
+│ ● HEALTHY      last sync 3m      mode bidirectional                         │
+╰────────────────────────────────────────────────────────────────────────────╯
+╭─ devices ──────────────────────────────────────────────────────────────────╮
+│ device      host                              up   rsync   files  size  free│
+│ initiator   my-laptop                         ●     ✓       350   235M  300G│
+│             ↳ my-laptop  ·  100.x.y.z                                       │
+│ target      my-server                         ●     ✓       350   235M  534G│
+│             ↳ my-server  ·  100.a.b.c                                       │
+╰────────────────────────────────────────────────────────────────────────────╯
+  + sync state · paths · safety net · pending — all live, keyboard-driven
 ```
 
-## Why
+## Architecture
 
-osync scatters its status across state files in `.osync_workdir/state/`, a log
-file, and whatever the last run printed. `osync-dash` reads all of it and the
-config, probes both ends, and renders a single glanceable view.
+- **`osync_core.py`** — data layer + one-shot renderer. **Standard library only**,
+  runs on the system Python. Powers `--print` and all the probing.
+- **`osync_tui.py`** — the interactive [Textual](https://textual.textualize.io)
+  app. The one third-party dependency, kept in a project virtualenv.
+- **`osync-dash`** — thin launcher: interactive → Textual (venv); otherwise →
+  the stdlib one-shot renderer.
+
+So the TUI is a proper app (mouse, resize, background refresh, key bindings),
+while `--print` stays dependency-free for scripts, cron, and non-TTY pipes.
 
 ## Requirements
 
-- Python 3 (standard library only — no `pip install`)
-- `osync` (`osync.sh` on `PATH` or at `/usr/local/bin/osync.sh`)
+- Python 3.8+
+- `osync` (`osync.sh` on `PATH` or `/usr/local/bin/osync.sh`)
 - `rsync` + `ssh` on both ends (already required by osync)
-- Optional: `fzf` (config picker when you have multiple jobs)
+- The TUI needs `textual` — `install.sh` puts it in a local `.venv`
+- Optional: `fzf` (config picker), `tailscale` (device names in the table)
 
 ## Install
 
 ```sh
 git clone https://github.com/bk-bf/osync-dash.git
-ln -s "$PWD/osync-dash/osync-dash" ~/.local/bin/osync-dash   # anywhere on PATH
+cd osync-dash
+./install.sh            # creates .venv, installs Textual, symlinks to ~/.local/bin
 ```
+
+`./install.sh [BINDIR]` to link somewhere else. The `--print` path works even
+without the venv (system Python, stdlib only).
 
 ## Usage
 
-Just run it for the interactive full-screen TUI (auto-refreshing, keyboard-driven):
-
 ```sh
-osync-dash                 # interactive TUI for the sole ~/.config/osync/*.conf
-osync-dash -c path.conf    # a specific job
+osync-dash              # interactive Textual TUI (auto-discovers ~/.config/osync/*.conf)
+osync-dash -c job.conf  # a specific job
 ```
 
-Inside the TUI:
+In the TUI:
 
 | key | action |
 |-----|--------|
 | `r` | refresh now |
 | `c` | run the pending-changes dry-run |
-| `s` | run the sync (streams osync, returns to the TUI) |
+| `s` | run the sync (suspends to stream osync, then returns) |
 | `l` | page the osync log |
-| `↑ ↓` `PgUp` `PgDn` `g` `G` | scroll |
-| `q` / `Esc` | quit |
+| `q` | quit |
 
-Status refreshes on a background thread every few seconds, so ssh probes never
-freeze input. Terminal resize is handled, and it works fine over SSH.
+Status refreshes on a background thread, so ssh probes never freeze the UI.
+Resize and mouse work; it's fine over SSH.
 
 ### Non-interactive
 
-Piped output, or `--print`, falls back to a one-shot render of the same panels:
-
 ```sh
-osync-dash --print          # one-shot to stdout (automatic when piped)
+osync-dash --print          # one-shot render to stdout (automatic when piped)
 osync-dash --print --fast    # skip the pending dry-run
 osync-dash --sync           # run the sync, print the result, exit
 osync-dash --log            # page the osync log, exit
 osync-dash --local-only     # offline: skip the remote probe
 ```
 
-Configs are auto-discovered in `~/.config/osync/*.conf`; with more than one it
-fzf-picks (or falls back to the first). See `osync-dash --help` for all flags.
-
 ## How it reads status
 
-| Field        | Source |
-|--------------|--------|
-| health       | `*-last-action-<instance>` + `resume-count-<instance>` state files, plus live reachability |
-| last run     | mtime of the initiator `last-action` state file |
-| devices      | system hostname (local `gethostname`, remote `hostname`) + Tailscale device name/IP from `tailscale status` |
-| files/size   | live walk locally; one combined `ssh` probe remotely |
-| free space   | `statvfs` locally, `df` remotely |
-| safety net   | file counts under `.osync_workdir/{deleted,backup}` on both sides |
-| pending      | `osync … --dry --summary`, parsed for update/deletion counts |
+| Field    | Source |
+|----------|--------|
+| health   | `*-last-action-<instance>` + `resume-count-<instance>` state files, plus live reachability |
+| last run | mtime of the initiator `last-action` state file |
+| devices  | system hostname (local `gethostname`, remote `hostname`) + Tailscale device name/IP from `tailscale status` |
+| files/size | live walk locally; one combined `ssh` probe remotely |
+| free space | `statvfs` locally, `df` remotely |
+| safety net | file counts under `.osync_workdir/{deleted,backup}` on both sides |
+| pending  | `osync … --dry --summary`, parsed for update/deletion counts |
 
 ## License
 
