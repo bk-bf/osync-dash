@@ -133,13 +133,17 @@ def pushpull_line(cfg, tgt, state, local, remote, spin) -> Text:
     push_cnt = local.get("changed")            # local changes → push to remote
     pull_cnt = dev_remote.get("changed")       # remote changes → pull to local
 
-    def leg(arrow, verb, cnt, relevant, active):
+    def leg(arrow, verb, cnt, relevant):
         s = Text()
         if not relevant:                        # one-way sync: other leg is off
             s.append(f"{arrow} {verb} ", style=LINE)
             s.append("off", style=LINE)
             return s
-        if active:
+        # only show "transferring" for a direction that actually has changes to
+        # move (cnt None = never synced yet → assume the first sync moves it).
+        # osync works one direction at a time, so with changes on just one side
+        # only that leg lights up — never both for nothing.
+        if running and (cnt is None or cnt > 0):
             s.append(f"{frame} ", style=GOLD)
             s.append(f"{verb} ", style=f"bold {GOLD}")
             s.append("transferring…", style=GOLD)
@@ -157,9 +161,9 @@ def pushpull_line(cfg, tgt, state, local, remote, spin) -> Text:
 
     push_rel, pull_rel = d in ("send", "bidir"), d in ("receive", "bidir")
     t = Text("  ")
-    t.append_text(leg("↑", "push", push_cnt, push_rel, running and push_rel))
+    t.append_text(leg("↑", "push", push_cnt, push_rel))
     t.append("        ")
-    t.append_text(leg("↓", "pull", pull_cnt, pull_rel, running and pull_rel))
+    t.append_text(leg("↓", "pull", pull_cnt, pull_rel))
     return t
 
 
