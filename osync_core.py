@@ -306,13 +306,11 @@ def probe_remote(cfg: dict, tgt: dict, baseline=None) -> dict:
 
 
 def sync_running(sync_dir: Path) -> bool:
-    """Cheap, local-only 'is a sync in progress?' — osync holds a lock file in
-    the state dir while running. No ssh, no pgrep, so it's fine to poll often
-    (used for the live push/pull spinner)."""
-    sd = Path(sync_dir) / OSYNC_DIR / "state"
+    """Cheap, local-only 'is a sync in progress?' — osync holds a lock file at
+    <sync>/.osync_workdir/lock for the whole run. No ssh, no pgrep, so it's fine
+    to poll often (used for the live spinner + skip-probe-during-sync)."""
     try:
-        return sd.is_dir() and any(p.name.endswith(".lock") or p.name == "lock"
-                                   for p in sd.iterdir())
+        return (Path(sync_dir) / OSYNC_DIR / "lock").exists()
     except OSError:
         return False
 
@@ -342,12 +340,8 @@ def probe_state(cfg: dict, sync_dir: Path) -> dict:
     d["init_action"] = _state_text(sd / f"initiator-last-action-{inst}")
     d["tgt_action"] = _state_text(sd / f"target-last-action-{inst}")
     d["resume"] = _state_text(sd / f"resume-count-{inst}")
-    # running? lock file in state dir or a live osync process for this config
-    try:
-        if sd.is_dir() and any(p.name.endswith(".lock") or p.name == "lock" for p in sd.iterdir()):
-            d["running"] = True
-    except OSError:
-        pass
+    # running? lock file (fast) or a live osync process for this config
+    d["running"] = sync_running(sync_dir)
     rc2, out = run(["pgrep", "-fa", "osync.sh"], timeout=5)
     if rc2 == 0 and inst:
         for line in out.splitlines():
@@ -1239,7 +1233,7 @@ def auto_status(name: str) -> dict:
     """Live systemd state for a connection's auto units, for the card display.
     {loaded, active, failed, next_secs, last_ok}. All best-effort / cheap."""
     st = {"loaded": False, "active": False, "failed": False,
-          "next_secs": None, "last_ok": None}
+          "next_ts": None, "last_ok": None}
     if not have_systemd():
         return st
     base = _unit_base(name)
@@ -1262,7 +1256,9 @@ def auto_status(name: str) -> dict:
     if mono is None and raw.isdigit():
         mono = int(raw) / 1e6
     if mono is not None:
-        st["next_secs"] = max(0, mono - time.monotonic())
+        # store an ABSOLUTE wall-clock target so the card can tick the countdown
+        # down every second without re-querying systemd.
+        st["next_ts"] = time.time() + max(0, mono - time.monotonic())
     return st
 
 

@@ -191,9 +191,9 @@ def auto_line(cfg, auto_st) -> Text:
     elif st.get("active"):
         t.append("⟳ ", style=MINT)
         t.append(desc, style=MINT)
-        nxt = st.get("next_secs")
+        nxt = st.get("next_ts")
         if nxt is not None:
-            t.append(f"  · next in {core.human_age(nxt)}", style=MUTED)
+            t.append(f"  · next in {core.human_age(max(0, nxt - core.time.time()))}", style=MUTED)
         if st.get("last_ok"):
             t.append("  · last ok", style=MUTED)
     else:
@@ -856,9 +856,10 @@ class OsyncDash(App):
         self.register_theme(AYU)
         self.theme = "ayu"
         self._build_cards()
-        self.set_interval(self.interval, self.action_refresh)
-        self.set_interval(0.12, self._tick)
-        self.set_interval(1.5, self._poll_running)  # cheap live sync detection
+        self.set_interval(self.interval, self.action_refresh)   # slow: probe (ssh)
+        self.set_interval(1.0, self._clock_tick)                # fast: live time
+        self.set_interval(0.12, self._tick)                     # spinner animation
+        self.set_interval(1.5, self._poll_running)              # live sync detection
 
     # cards ---------------------------------------------------------------
     def _build_cards(self):
@@ -904,6 +905,13 @@ class OsyncDash(App):
             d = self.data.get(name)
             if d and d[0].get("running"):
                 self._render_card(name)
+
+    def _clock_tick(self):
+        """Re-render every card each second so the time fields (last sync N ago,
+        next in N, disk/counts labels) stay live — pure render from cached data,
+        no probing. The expensive ssh gather stays on its own slow interval."""
+        for name in list(self.data):
+            self._render_card(name)
 
     # workers -------------------------------------------------------------
     @work(thread=True, group="refresh", exclusive=False)
