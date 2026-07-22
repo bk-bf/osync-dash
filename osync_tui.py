@@ -908,6 +908,14 @@ class OsyncDash(App):
     # workers -------------------------------------------------------------
     @work(thread=True, group="refresh", exclusive=False)
     def refresh_one(self, name, cfg, tgt):
+        sync_dir = os.path.expanduser(cfg.get("INITIATOR_SYNC_DIR", ""))
+        if core.sync_running(sync_dir):
+            # a sync is in progress — don't probe. osync is rewriting the tree
+            # and using the ssh link, so a probe now races it and the in-flight
+            # numbers are meaningless. The 1.5 s lock poll keeps the spinner
+            # going; _apply_running re-probes the moment the sync finishes.
+            self.call_from_thread(self._mark_running, name)
+            return
         try:
             data = core.gather(cfg, tgt, self.local_only)
         except Exception as e:  # noqa: BLE001
@@ -918,6 +926,12 @@ class OsyncDash(App):
         except Exception:  # noqa: BLE001
             auto = None
         self.call_from_thread(self._apply, name, data, auto)
+
+    def _mark_running(self, name):
+        d = self.data.get(name)
+        if d and not d[0].get("running"):
+            d[0]["running"] = True
+            self._render_card(name)
 
     @work(thread=True, group="pending", exclusive=False)
     def check_pending(self, name):
