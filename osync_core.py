@@ -232,6 +232,7 @@ def probe_local(sync_dir: Path, baseline=None) -> dict:
     if not d["reach"]:
         return d
     files = size = changed = 0
+    newest = 0.0
     for root, dirs, fs in os.walk(sync_dir):
         if OSYNC_DIR in Path(root).parts:
             dirs[:] = [x for x in dirs if x != OSYNC_DIR]
@@ -244,6 +245,8 @@ def probe_local(sync_dir: Path, baseline=None) -> dict:
                 stt = fp.stat()
                 size += stt.st_size
                 files += 1
+                if stt.st_mtime > newest:
+                    newest = stt.st_mtime
                 # git-style live diff: files touched since the last sync are the
                 # local changes waiting to push (mtime beats the baseline).
                 if baseline is not None and stt.st_mtime > baseline:
@@ -251,6 +254,7 @@ def probe_local(sync_dir: Path, baseline=None) -> dict:
             except OSError:
                 pass
     d["files"], d["size"] = files, size
+    d["newest"] = newest or None
     d["changed"] = changed if baseline is not None else None
     try:
         st = os.statvfs(sync_dir)
@@ -1477,12 +1481,14 @@ def probe_incoming(beacon: dict) -> dict:
     """Status of one incoming push, seen from THIS (receiving) node's side."""
     d = Path(os.path.expanduser(beacon.get("dir", "")))
     inst = beacon.get("connection", "")
-    last_ts = _state_mtime(d / OSYNC_DIR / "state" / f"target-last-action-{inst}")
-    info = probe_local(d) if d.is_dir() else {"reach": False, "files": None, "size": None}
+    info = probe_local(d) if d.is_dir() else {"reach": False, "files": None,
+                                              "size": None, "newest": None}
+    # osync keeps last-action state on the initiator only, so the receiver has
+    # no push timestamp — the freshest file's mtime is the honest local proxy.
     return {"from_node": beacon.get("from_node", "?"), "connection": inst,
             "dir": str(d), "source_dir": beacon.get("source_dir", ""),
-            "last_ts": last_ts, "files": info.get("files"), "size": info.get("size"),
-            "reach": info.get("reach", False)}
+            "newest": info.get("newest"), "files": info.get("files"),
+            "size": info.get("size"), "reach": info.get("reach", False)}
 
 
 def gather(cfg, tgt, local_only=False):

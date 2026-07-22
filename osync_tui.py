@@ -314,10 +314,10 @@ def incoming_body(inc) -> Group:
     hdr = Text("  ")
     hdr.append("← ", style=BLUE)
     hdr.append(f"from {inc['from_node']}", style=f"bold {WHITE}")
-    if inc.get("last_ts"):
-        hdr.append(f"    received {core.human_age(core.time.time() - inc['last_ts'])} ago", style=MUTED)
+    if inc.get("newest"):
+        hdr.append(f"    newest file {core.human_age(core.time.time() - inc['newest'])} ago", style=MUTED)
     else:
-        hdr.append("    nothing received yet", style=LINE)
+        hdr.append("    no files yet", style=LINE)
     l2 = Text("  ")
     l2.append("into ", style=MUTED)
     l2.append(inc["dir"], style=WHITE)
