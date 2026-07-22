@@ -20,7 +20,7 @@ set -euo pipefail
 REPO="${OSYNC_DASH_REPO:-https://github.com/bk-bf/osync-dash.git}"
 PREFIX="${OSYNC_DASH_HOME:-$HOME/.local/share/osync-dash}"
 
-say() { printf '→ %s\n' "$*"; }
+say() { printf '→ %s\n' "$*" >&2; }  # stderr: never pollute $(resolve_src) etc.
 die() { printf 'osync-dash install: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
 
