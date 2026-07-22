@@ -66,7 +66,8 @@ COMPOSE_DEFAULTS = {"user": os.environ.get("USER", ""), "key": "~/.ssh/id_ed2551
 # global [settings] — portable across machines (notify command is configurable
 # so it isn't hard-wired to notify-send). delete_guard = block a sync whose
 # dry-run would propagate more than N deletions (0 disables the guard).
-SETTINGS_DEFAULTS = {"notify": True, "notify_cmd": "notify-send", "delete_guard": 25}
+SETTINGS_DEFAULTS = {"notify": True, "notify_cmd": "notify-send", "delete_guard": 25,
+                     "node": socket.gethostname()}
 STALE_AFTER = 24 * 3600  # a sync older than this flips health to STALE
 
 # ── ANSI ────────────────────────────────────────────────────────────────────
@@ -655,7 +656,7 @@ REMOTE_HOST_PING=false
 REMOTE_3RD_PARTY_HOSTS=""
 
 [MISC_OPTIONS]
-RSYNC_OPTIONAL_ARGS=""
+RSYNC_OPTIONAL_ARGS="{rsync_args}"
 PRESERVE_PERMISSIONS=true
 ## owner/group off: replicas usually run as different users, and preserving
 ## them needs sudo on the target. Flip to true if both sides share the user.
@@ -742,6 +743,11 @@ def conf_text(*, instance, initiator_dir, user, path, key="~/.ssh/id_ed25519",
     # primary host: TS unless mode is ssh-only
     host, port = (ssh_host, ssh_port) if mode == "ssh" else (ts_host, ts_port)
     initiator = os.path.expanduser(initiator_dir)
+    # push/pull (one-way) connections carry rsync --update: never clobber a file
+    # that's newer on the receiver. That's what makes "newest change wins" true
+    # in the mesh, where each device just pushes its own changes out. bidir keeps
+    # osync's own conflict resolution instead.
+    rsync_args = "--update" if direction in ("send", "receive") else ""
     return CONFIG_TEMPLATE.format(
         instance=instance, initiator=initiator,
         target_uri=target_uri(user, host, port, path),
@@ -750,7 +756,7 @@ def conf_text(*, instance, initiator_dir, user, path, key="~/.ssh/id_ed25519",
         logfile=os.path.expanduser(f"~/.cache/osync/{slug}.log"),
         user=user, path=path, ts_host=ts_host, ts_port=ts_port or "22",
         ssh_host=ssh_host, ssh_port=ssh_port or "22", mode=mode,
-        sync_type=DIRECTION_SYNC.get(direction, ""), exclude=exclude,
+        sync_type=DIRECTION_SYNC.get(direction, ""), exclude=exclude, rsync_args=rsync_args,
         soft_delete_days=soft_delete_days, conflict_backup_days=conflict_backup_days)
 
 

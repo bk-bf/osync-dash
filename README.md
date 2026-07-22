@@ -157,7 +157,7 @@ In the TUI, actions apply to the **focused card** (move focus with ↑/↓ or `j
 | `c` | pending-changes dry-run (focused card) |
 | `s` | run the sync (suspends to stream osync, then returns) |
 | `t` | cycle the endpoint mode (Tailscale / SSH / both) |
-| `d` | cycle the sync direction (bidirectional / send → / receive ←) |
+| `d` | cycle the direction (push → / pull ← / bidirectional ⇄) |
 | `A` | **auto-sync** picker (off · on-change · periodic — interval or calendar) |
 | `a` | add a connection (floating form, appends to the compose file) |
 | `e` | edit the focused connection (same form, name fixed) |
@@ -169,6 +169,26 @@ In the TUI, actions apply to the **focused card** (move focus with ↑/↓ or `j
 Status refreshes on background threads, so ssh probes never freeze the UI.
 Resize and mouse work; it's fine over SSH. The theme follows btop's **ayu**
 palette, with gradient disk meters per machine.
+
+## Mesh model: every node pushes its own changes
+
+osync-dash is meant to run on **every device in the mesh** (Tailscale-style),
+and the dashboard is titled with the node you're on (`osync-dash · <hostname>`)
+— you see the mesh from *this node's* point of view.
+
+The default topology is **push, not bidirectional**: each device is the sole
+author of its own files and just **pushes them out** to peers. A two-way folder
+is simply *two* pushes — one owned by each side — so there's no central
+initiator and no shared lock to fight over. "Pulling" a peer's change is just
+that peer pushing to you.
+
+Push/pull connections carry rsync `--update`, which means **newest change wins**
+without a merge step: a push never overwrites a file that's newer on the
+receiver, so whichever version is newest ends up on both sides regardless of who
+pushes last. (Bidirectional stays available for the rare shared-file folder that
+needs osync's full conflict merge.) Ideal when each device owns distinct files
+(e.g. per-device session logs); for the same file edited on two devices before
+either pushes, the newer edit wins and the older is kept as a conflict backup.
 
 ## Mesh: add hosts, browse dirs, pick a direction
 
@@ -184,8 +204,8 @@ controller:
 - **Directory autocomplete** — type in the remote-dir field and it lists real
   subdirectories on that device over ssh (cached, drill in by selecting); the
   local-dir field does the same against your filesystem. No exact typing.
-- **Direction** — Bidirectional ⇄, Send → (local→remote), or Receive ←
-  (remote→local), mapped to osync's native `SYNC_TYPE`.
+- **Direction** — **Push →** (this node → peer; the mesh default), Pull ←, or
+  Bidirectional ⇄, mapped to osync's native `SYNC_TYPE`.
 
 Submitting the form appends a `[[connection]]` to the compose file and the new
 card appears immediately. On any card, `t` cycles the endpoint mode and `d` the

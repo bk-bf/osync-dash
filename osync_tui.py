@@ -80,7 +80,7 @@ def grad_bar(frac, width, c1, c2, bg=LINE) -> Text:
 
 MODE_LABEL = {"ts": ("Tailscale", MINT), "ssh": ("plain SSH", GOLD),
               "both": ("both · TS→SSH", BLUE), "": ("", MUTED)}
-DIR_LABEL = {"send": ("→ send to remote", GOLD), "receive": ("← receive from remote", BLUE),
+DIR_LABEL = {"send": ("→ push to peer", GOLD), "receive": ("← pull from peer", BLUE),
              "bidir": ("⇄ bidirectional", MINT)}
 DIR_ARROW = {"send": "→", "receive": "←", "bidir": "⇄"}
 
@@ -305,7 +305,8 @@ class ConnectionCard(Static):
 
 # ── add-connection modal (dynamic, mesh) ─────────────────────────────────────
 MODES = [("Tailscale", "ts"), ("Plain SSH", "ssh"), ("Both", "both")]
-DIRS = [("bidir", "bidir"), ("send", "send"), ("receive", "receive")]
+# order matches the radio buttons in AddHost (push-first is the mesh default)
+DIRS = [("send", "send"), ("receive", "receive"), ("bidir", "bidir")]
 
 
 class DirField(Vertical):
@@ -492,9 +493,9 @@ class AddHost(ModalScreen):
 
                 yield Label("direction")
                 with RadioSet(id="i_dir"):
-                    yield RadioButton("⇄ Bidirectional", value=True)
-                    yield RadioButton("→ Send")
-                    yield RadioButton("← Receive")
+                    yield RadioButton("→ Push  (this node → peer, newest wins)", value=True)
+                    yield RadioButton("← Pull  (peer → this node)")
+                    yield RadioButton("⇄ Bidirectional  (merge)")
 
                 yield Label("name")
                 yield Input(placeholder="desktop / nas / vps", id="i_name")
@@ -850,7 +851,8 @@ class OsyncDash(App):
 
     def _load_compose(self):
         self.conns = core.load_all()
-        self.title = "osync-dash"
+        node = core.parse_settings().get("node") or core.socket.gethostname()
+        self.title = f"osync-dash · {node}"   # this node's view of the mesh
         n = len(self.conns)
         self.sub_title = f"{n} connection{'' if n == 1 else 's'}"
 
@@ -1089,9 +1091,9 @@ class OsyncDash(App):
         cfg = next((c for n, c, _ in self.conns if n == name), None)
         if not cfg:
             return
-        order = ["bidir", "send", "receive"]
+        order = ["send", "receive", "bidir"]
         cur = core.direction_of(cfg)
-        new = order[(order.index(cur) + 1) % 3] if cur in order else "bidir"
+        new = order[(order.index(cur) + 1) % 3] if cur in order else "send"
         core.set_direction_conn(name, new)
         self._reload_conn(name)
         card = self._card(name)
