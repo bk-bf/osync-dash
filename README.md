@@ -2,23 +2,32 @@
 
 An interactive terminal dashboard for [osync](https://github.com/deajan/osync)
 two-way sync jobs, built with [Textual](https://github.com/Textualize/textual).
-One view shows the whole picture: health, both machines (local + remote over
-SSH, with hostnames and Tailscale identity), paths, the soft-delete/backup
-safety net, and a live pending-changes dry-run.
+**One compose file defines many connections** (docker-compose style), and each
+gets its own always-expanded card: merged health + sync-state, both machines
+(local + remote over SSH, with hostnames and Tailscale identity), live
+↑push/↓pull activity, paths, and the soft-delete/backup safety net.
 
 ```
-╭─ health ───────────────────────────────────────────────────────────────────╮
-│ ● HEALTHY      last sync 3m      mode bidirectional                         │
-╰────────────────────────────────────────────────────────────────────────────╯
-╭─ devices ──────────────────────────────────────────────────────────────────╮
-│ device      host                              up   rsync   files  size  free│
-│ local      my-laptop                         ●     ✓       350   235M  300G│
-│             ↳ my-laptop  ·  100.x.y.z                                       │
-│ remote     my-server                         ●     ✓       350   235M  534G│
-│             ↳ my-server  ·  100.a.b.c                                       │
-╰────────────────────────────────────────────────────────────────────────────╯
-  + sync state · paths · safety net · pending — all live, keyboard-driven
+┌ ubuntuserver  ⇄ ──────────────────────────────────────────────────────────┐
+│ ● HEALTHY   last sync 3m ago                                               │
+│ ↑ push idle          ↓ pull idle                                          │
+│ result synced · remote synced · resume 0 clean                            │
+│                                                                            │
+│ ▎ local   my-laptop    ● online   rsync ✓   ↳ my-laptop · 100.x.y.z       │
+│     350 files · 235M    disk ███████──────── 41%  300G free               │
+│ ▎ remote  my-server    ● online   rsync ✓   ↳ my-server · 100.a.b.c       │
+│     350 files · 235M    disk █████─────────── 28%  534G free              │
+│                                                                            │
+│ local  ~/docs    remote  ubuntu@my-server:/srv/docs   via Tailscale …     │
+└────────────────────────────────────────────────────────────────────────────┘
+┌ laptop  → ────────────────────────────────────────────────────────────────┐
+│ ● RUNNING  ⠹ running   ↑ push ⠹ transferring…   ↓ pull idle  …            │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
+
+When a sync is running, the ↑push / ↓pull legs animate a spinner (for the
+direction that's actually moving data); otherwise they show the queued counts
+from the last dry-run. Cards are focusable — actions apply to the focused one.
 
 ## Architecture
 
@@ -34,11 +43,11 @@ while `--print` stays dependency-free for scripts, cron, and non-TTY pipes.
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.11+ (uses stdlib `tomllib`)
 - `osync` (`osync.sh` on `PATH` or `/usr/local/bin/osync.sh`)
 - `rsync` + `ssh` on both ends (already required by osync)
 - The TUI needs `textual` — `install.sh` puts it in a local `.venv`
-- Optional: `fzf` (config picker), `tailscale` (device names in the table)
+- Optional: `tailscale` (device names + import dropdown)
 
 ## Install
 
@@ -54,25 +63,60 @@ without the venv (system Python, stdlib only).
 ## Usage
 
 ```sh
-osync-dash              # interactive Textual TUI (auto-discovers ~/.config/osync/*.conf)
-osync-dash -c job.conf  # a specific job
+osync-dash              # interactive Textual TUI — every connection, all at once
 ```
 
-In the TUI:
+All connections live in a single compose file,
+**`~/.config/osync/osync-dash.toml`** — no picker, no prompt. On first run, any
+existing `~/.config/osync/*.conf` jobs are folded into it automatically (the old
+files are left untouched).
+
+```toml
+# ~/.config/osync/osync-dash.toml
+[defaults]
+user = "ubuntu"
+key  = "~/.ssh/id_ed25519"
+
+[[connection]]
+name = "ubuntuserver"
+local = "~/docs"
+remote = "/srv/docs"
+direction = "bidir"          # bidir | send | receive
+mode = "both"                # ts | ssh | both
+ts_host = "ubuntuserver.tailXXXX.ts.net"
+ssh_host = "192.168.1.50"
+
+[[connection]]
+name = "laptop"
+local = "~/notes"
+remote = "/home/kirill/notes"
+direction = "send"
+mode = "ssh"
+ssh_host = "laptop.local"
+```
+
+Each `[[connection]]` is a two-way osync job between **this machine** and a host
+(so a mesh like `server ⇄ desktop ⇄ laptop` is just two connections on the
+desktop). osync-dash materialises a real osync `.conf` per connection into
+`~/.cache/osync/generated/` when it needs to run osync — the compose file stays
+the single source of truth.
+
+In the TUI, actions apply to the **focused card** (move focus with ↑/↓ or `j`/`k`):
 
 | key | action |
 |-----|--------|
-| `r` | refresh now |
-| `c` | run the pending-changes dry-run |
+| `↑`/`↓`, `j`/`k` | move focus between connection cards |
+| `r` | refresh all connections |
+| `c` | pending-changes dry-run (focused card) |
 | `s` | run the sync (suspends to stream osync, then returns) |
 | `t` | cycle the endpoint mode (Tailscale / SSH / both) |
 | `d` | cycle the sync direction (bidirectional / send → / receive ←) |
-| `n` | open the host switcher (floating popup; dashboard stays visible behind) |
-| `a` | add a new host (floating form, writes a new config) |
+| `A` | cycle **auto-sync** (off → on-change → periodic) for the focused card |
+| `a` | add a connection (floating form, appends to the compose file) |
 | `l` | page the osync log |
 | `q` | quit |
 
-Status refreshes on a background thread, so ssh probes never freeze the UI.
+Status refreshes on background threads, so ssh probes never freeze the UI.
 Resize and mouse work; it's fine over SSH. The theme follows btop's **ayu**
 palette, with gradient disk meters per machine.
 
@@ -93,9 +137,29 @@ controller:
 - **Direction** — Bidirectional ⇄, Send → (local→remote), or Receive ←
   (remote→local), mapped to osync's native `SYNC_TYPE`.
 
-Each job in `~/.config/osync/*.conf` is a host; cycle them from the `n` popup.
-On the dashboard, `t` cycles the endpoint mode and `d` the direction live. All
-osync-dash bookkeeping lives in `DASH_*` keys that osync ignores.
+Submitting the form appends a `[[connection]]` to the compose file and the new
+card appears immediately. On any card, `t` cycles the endpoint mode and `d` the
+direction live (both rewrite that connection's entry in the compose file).
+
+## Auto-sync (off · on-change · periodic)
+
+osync is a batch tool — one run, one reconciliation, then it exits. By default
+nothing syncs until you press `s`. Press **`A`** on a card to open the auto-sync
+picker; osync-dash writes and manages a **systemd `--user`** unit for it:
+
+- **on file change** — runs `osync.sh <conf> --on-changes`, osync's inotify
+  monitor, as a long-lived service. Syncs shortly after changes settle.
+  (Needs `inotify-tools` / `inotifywait`.)
+- **periodic** — a oneshot sync service fired by a `.timer` on the interval you
+  choose: presets from **1 minute to 2 weeks**, or a custom value like `90m`,
+  `6h`, `2d`, `10d`, `1w`. Stored as `interval = "6h"` on the connection.
+- **off** — manual only.
+
+Units are named `osync-dash-<name>.{service,timer}` under
+`~/.config/systemd/user/`. They survive logout/reboot **if user lingering is
+on** (`loginctl enable-linger $USER`); otherwise they run only while you're
+logged in. The mode shows on each card under **auto-sync**, and is stored as
+`auto = "change|periodic|off"` in the compose file.
 
 ### Non-interactive
 

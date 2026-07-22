@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """osync-dash — terminal dashboard for osync sync jobs (core / one-shot renderer).
 
-Reads an osync config, probes both replicas (local + remote over ssh), and
-renders health, devices, paths and the soft-delete/backup safety net. This
-core is pure Python stdlib; the interactive TUI (osync_tui.py) adds Textual.
+Reads the compose file (~/.config/osync/osync-dash.toml), which defines many
+sync connections in one place, probes both replicas of each (local + remote
+over ssh), and renders health, devices, paths and the soft-delete/backup safety
+net. This core is pure Python stdlib; the interactive TUI (osync_tui.py) adds
+Textual.
 
 Usage:
-    osync-dash [-c CONFIG] [options]
+    osync-dash [-c NAME] [options]
 
 Run with no arguments for the interactive Textual TUI (auto-refreshing,
-keyboard-driven). In the TUI:  r refresh · c check pending · s sync · l log
-· q quit.
+keyboard-driven), which shows every connection as its own card. In the TUI:
+r refresh · c check pending · s sync · l log · q quit.
 
-Piped or with --print it falls back to a one-shot render of the same panels.
+Piped or with --print it falls back to a one-shot render of every connection.
 
 Options:
-    -c, --config PATH   osync .conf to inspect. Default: auto-discover in
-                        ~/.config/osync (fzf-picks if more than one).
+    -c, --config NAME   Limit to one connection (by name) or a standalone .conf
+                        path. Default: all connections in the compose file.
     -p, --print         One-shot render to stdout instead of the TUI (also the
                         automatic behaviour when output is piped).
     -f, --fast          Skip the pending dry-run (no ssh rsync pass).
@@ -39,11 +41,18 @@ import socket
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 
 OSYNC_BIN = shutil.which("osync.sh") or "/usr/local/bin/osync.sh"
 OSYNC_DIR = ".osync_workdir"
 CONFIG_HOME = Path(os.path.expanduser("~/.config/osync"))
+# single source of truth: one compose file defining many sync connections
+COMPOSE_FILE = CONFIG_HOME / "osync-dash.toml"
+# real osync .conf files are materialised here on demand (one per connection)
+GEN_DIR = Path(os.path.expanduser("~/.cache/osync/generated"))
+COMPOSE_DEFAULTS = {"user": os.environ.get("USER", ""), "key": "~/.ssh/id_ed25519",
+                    "soft_delete_days": 30, "conflict_backup_days": 30}
 STALE_AFTER = 24 * 3600  # a sync older than this flips health to STALE
 
 # ── ANSI ────────────────────────────────────────────────────────────────────
@@ -529,7 +538,7 @@ RSYNC_EXECUTABLE=rsync
 RSYNC_REMOTE_PATH=""
 RSYNC_PATTERN_FIRST=include
 RSYNC_INCLUDE_PATTERN=""
-RSYNC_EXCLUDE_PATTERN=""
+RSYNC_EXCLUDE_PATTERN="{exclude}"
 RSYNC_INCLUDE_FROM=""
 RSYNC_EXCLUDE_FROM=""
 PATH_SEPARATOR_CHAR=";"
@@ -579,10 +588,10 @@ LOG_CONFLICTS=false
 ALERT_CONFLICTS=false
 CONFLICT_BACKUP=true
 CONFLICT_BACKUP_MULTIPLE=false
-CONFLICT_BACKUP_DAYS=30
+CONFLICT_BACKUP_DAYS={conflict_backup_days}
 CONFLICT_PREVALANCE=initiator
 SOFT_DELETE=true
-SOFT_DELETE_DAYS=30
+SOFT_DELETE_DAYS={soft_delete_days}
 SKIP_DELETION=
 SYNC_TYPE={sync_type}
 
@@ -628,28 +637,38 @@ def mode_of(cfg: dict) -> str:
     return cfg.get("DASH_ENDPOINT_MODE", "") or ""
 
 
-def create_config(*, instance, initiator_dir, user, path, key="~/.ssh/id_ed25519",
-                  ts_host="", ts_port="22", ssh_host="", ssh_port="22",
-                  mode="ts", direction="bidir") -> Path:
-    """Write a new osync .conf for a host. Returns the path. Raises on collision."""
-    CONFIG_HOME.mkdir(parents=True, exist_ok=True)
-    inst = _slug(instance)
-    cfg_path = CONFIG_HOME / f"{inst}.conf"
-    if cfg_path.exists():
-        raise FileExistsError(f"{cfg_path} already exists")
+def conf_text(*, instance, initiator_dir, user, path, key="~/.ssh/id_ed25519",
+              ts_host="", ts_port="22", ssh_host="", ssh_port="22",
+              mode="ts", direction="bidir", exclude="",
+              soft_delete_days=30, conflict_backup_days=30) -> str:
+    """Render a complete osync .conf for one connection (no disk writes)."""
+    # INSTANCE_ID must be the name VERBATIM — osync keys all of its state/tree
+    # files by it, so slugging (e.g. documents_remote -> documents-remote) would
+    # orphan an existing replica and trigger a bogus full re-sync. Slug is only
+    # safe for on-disk file names (log, generated .conf).
+    slug = _slug(instance)
     # primary host: TS unless mode is ssh-only
     host, port = (ssh_host, ssh_port) if mode == "ssh" else (ts_host, ts_port)
     initiator = os.path.expanduser(initiator_dir)
-    text = CONFIG_TEMPLATE.format(
-        instance=inst, initiator=initiator,
+    return CONFIG_TEMPLATE.format(
+        instance=instance, initiator=initiator,
         target_uri=target_uri(user, host, port, path),
         active_label=f"{user}@{host}:{path}",
         key=os.path.expanduser(key) if key else "",
-        logfile=os.path.expanduser(f"~/.cache/osync/{inst}.log"),
+        logfile=os.path.expanduser(f"~/.cache/osync/{slug}.log"),
         user=user, path=path, ts_host=ts_host, ts_port=ts_port or "22",
         ssh_host=ssh_host, ssh_port=ssh_port or "22", mode=mode,
-        sync_type=DIRECTION_SYNC.get(direction, ""))
-    cfg_path.write_text(text)
+        sync_type=DIRECTION_SYNC.get(direction, ""), exclude=exclude,
+        soft_delete_days=soft_delete_days, conflict_backup_days=conflict_backup_days)
+
+
+def create_config(*, instance, **kw) -> Path:
+    """Write a new standalone osync .conf into CONFIG_HOME. Raises on collision."""
+    CONFIG_HOME.mkdir(parents=True, exist_ok=True)
+    cfg_path = CONFIG_HOME / f"{_slug(instance)}.conf"
+    if cfg_path.exists():
+        raise FileExistsError(f"{cfg_path} already exists")
+    cfg_path.write_text(conf_text(instance=instance, **kw))
     Path(os.path.expanduser("~/.cache/osync")).mkdir(parents=True, exist_ok=True)
     return cfg_path
 
@@ -716,6 +735,354 @@ def cycle_mode(cfg_path: Path) -> tuple[str, str]:
 def set_direction(cfg_path: Path, direction: str) -> str:
     _rewrite_conf(cfg_path, {"SYNC_TYPE": DIRECTION_SYNC.get(direction, "")})
     return direction
+
+
+# ── compose file (one TOML → many connections, docker-compose style) ─────────
+MODE_CYCLE = {"ts": "Tailscale", "ssh": "plain SSH", "both": "both (TS→SSH fallback)"}
+
+
+def parse_compose() -> tuple[dict, list[dict]]:
+    """Return (defaults, connections) from the compose TOML. Empty if absent."""
+    if not COMPOSE_FILE.exists():
+        return dict(COMPOSE_DEFAULTS), []
+    try:
+        with open(COMPOSE_FILE, "rb") as f:
+            data = tomllib.load(f)
+    except (tomllib.TOMLDecodeError, OSError):
+        return dict(COMPOSE_DEFAULTS), []
+    defaults = {**COMPOSE_DEFAULTS, **(data.get("defaults") or {})}
+    conns = [c for c in (data.get("connection") or []) if c.get("name")]
+    return defaults, conns
+
+
+def _toml_val(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+# key order for readable, stable output
+_CONN_ORDER = ["name", "local", "remote", "direction", "mode", "user", "key",
+               "ts_host", "ts_port", "ssh_host", "ssh_port", "exclude",
+               "auto", "interval"]
+
+
+def dump_compose(defaults: dict, conns: list[dict]) -> None:
+    """Serialise the compose file (tool-managed; hand comments are not kept)."""
+    lines = ["# osync-dash compose — one file, many sync connections.",
+             "# Managed by osync-dash (a add · t endpoint · d direction), editable by hand.",
+             "# Each [[connection]] is a two-way osync job between this machine and a host.",
+             "", "[defaults]"]
+    for k, v in defaults.items():
+        lines.append(f"{k} = {_toml_val(v)}")
+    for c in conns:
+        lines.append("")
+        lines.append("[[connection]]")
+        keys = [k for k in _CONN_ORDER if k in c] + [k for k in c if k not in _CONN_ORDER]
+        for k in keys:
+            lines.append(f"{k} = {_toml_val(c[k])}")
+    COMPOSE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    COMPOSE_FILE.write_text("\n".join(lines) + "\n")
+
+
+def add_connection(conn: dict) -> str:
+    defaults, conns = parse_compose()
+    if any(c.get("name") == conn["name"] for c in conns):
+        raise FileExistsError(f"a connection named '{conn['name']}' already exists")
+    conns.append(conn)
+    dump_compose(defaults, conns)
+    return conn["name"]
+
+
+def update_connection(name: str, updates: dict) -> None:
+    defaults, conns = parse_compose()
+    for c in conns:
+        if c.get("name") == name:
+            c.update(updates)
+    dump_compose(defaults, conns)
+
+
+def remove_connection(name: str) -> None:
+    defaults, conns = parse_compose()
+    dump_compose(defaults, [c for c in conns if c.get("name") != name])
+    if have_systemd():
+        _write_units(name, "off", 15, "")  # stop + remove any auto units
+
+
+def _conn_fields(conn: dict, defaults: dict) -> dict:
+    """Map a compose connection (+ defaults) to conf_text() kwargs."""
+    g = lambda k, d="": conn.get(k, defaults.get(k, d))  # noqa: E731
+    return dict(
+        instance=conn["name"], initiator_dir=conn.get("local", "~"),
+        user=g("user"), path=conn.get("remote", "~"),
+        key=g("key", "~/.ssh/id_ed25519"),
+        ts_host=conn.get("ts_host", ""), ts_port=str(conn.get("ts_port", "22")),
+        ssh_host=conn.get("ssh_host", ""), ssh_port=str(conn.get("ssh_port", "22")),
+        mode=conn.get("mode", "ts"), direction=conn.get("direction", "bidir"),
+        exclude=conn.get("exclude", ""),
+        soft_delete_days=g("soft_delete_days", 30),
+        conflict_backup_days=g("conflict_backup_days", 30))
+
+
+def materialize(conn: dict, defaults: dict) -> Path:
+    """Write the real osync .conf for a connection into GEN_DIR; return its path."""
+    GEN_DIR.mkdir(parents=True, exist_ok=True)
+    p = GEN_DIR / f"{_slug(conn['name'])}.conf"
+    p.write_text(conf_text(**_conn_fields(conn, defaults)))
+    Path(os.path.expanduser("~/.cache/osync")).mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def connection_to_cfg(conn: dict, defaults: dict) -> tuple[dict, dict]:
+    """Materialise + parse one connection into the (cfg, tgt) pair the renderers
+    and probes expect — identical shape to a hand-written osync .conf."""
+    p = materialize(conn, defaults)
+    cfg = parse_config(p)
+    cfg["_configfile"] = str(p)
+    cfg["_connection"] = conn["name"]
+    cfg["_auto"] = conn.get("auto", "off")
+    cfg["_interval"] = parse_duration(conn.get("interval", "15m"))["human"]
+    tgt = parse_target(cfg.get("TARGET_SYNC_DIR", ""))
+    return cfg, tgt
+
+
+def load_all() -> list[tuple[str, dict, dict]]:
+    """Every connection as (name, cfg, tgt). Migrates legacy confs on first run."""
+    migrate_legacy()
+    defaults, conns = parse_compose()
+    out = []
+    for conn in conns:
+        try:
+            cfg, tgt = connection_to_cfg(conn, defaults)
+            out.append((conn["name"], cfg, tgt))
+        except Exception:  # noqa: BLE001 — skip a broken entry, keep the rest
+            continue
+    return out
+
+
+def cycle_mode_conn(name: str) -> tuple[str, str]:
+    """Cycle a connection's endpoint mode (ts→ssh→both) in the compose file."""
+    defaults, conns = parse_compose()
+    conn = next((c for c in conns if c.get("name") == name), None)
+    if not conn:
+        return "", "connection not found"
+    has_ts, has_ssh = bool(conn.get("ts_host")), bool(conn.get("ssh_host"))
+    modes = [m for m, ok in (("ts", has_ts), ("ssh", has_ssh),
+                             ("both", has_ts and has_ssh)) if ok]
+    if len(modes) < 2:
+        return "", "only one endpoint configured (add another in setup)"
+    cur = conn.get("mode", "ts")
+    new = modes[(modes.index(cur) + 1) % len(modes)] if cur in modes else modes[0]
+    update_connection(name, {"mode": new})
+    return new, f"endpoint: {MODE_CYCLE[new]}"
+
+
+def set_direction_conn(name: str, direction: str) -> None:
+    update_connection(name, {"direction": direction})
+
+
+# ── automatic sync via systemd --user units ──────────────────────────────────
+# off → manual only · change → osync --on-changes daemon (inotify) · periodic →
+# oneshot service fired by a timer every `interval` minutes.
+SYSTEMD_USER_DIR = Path(os.path.expanduser("~/.config/systemd/user"))
+AUTO_MODES = ["off", "change", "periodic"]
+AUTO_LABEL = {"off": "off (manual)", "change": "on file change", "periodic": "periodic"}
+
+_SVC_CHANGE = """\
+[Unit]
+Description=osync-dash continuous sync — {name}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin
+ExecStart={osync} {conf} --on-changes --silent
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+"""
+
+_SVC_ONESHOT = """\
+[Unit]
+Description=osync-dash scheduled sync — {name}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin
+ExecStart={osync} {conf} --summary --silent
+"""
+
+_TIMER = """\
+[Unit]
+Description=osync-dash periodic sync timer — {name}
+
+[Timer]
+OnActiveSec={interval}
+OnUnitActiveSec={interval}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+_DUR_SECS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+_DUR_SYS = {"m": "min", "h": "h", "d": "d", "w": "w"}  # systemd time-span units
+
+
+def _norm_unit(u: str) -> str:
+    u = (u or "m").lower()
+    if u in ("m", "min", "minute", "minutes"):
+        return "m"
+    if u in ("h", "hr", "hour", "hours"):
+        return "h"
+    if u in ("d", "day", "days"):
+        return "d"
+    if u in ("w", "week", "weeks"):
+        return "w"
+    return "m"
+
+
+def parse_duration(spec, default="15m") -> dict:
+    """Normalise a schedule spec into {store, systemd, seconds, human}.
+
+    Accepts '15m', '90m', '6h', '24h', '2d', '10d', '1w' (or a bare int =
+    minutes, for legacy compose files). Anything unparseable falls back to
+    `default`."""
+    s = str(spec).strip() if spec not in (None, "") else default
+    m = re.match(r"^(\d+)\s*([A-Za-z]*)$", s)
+    if not m:
+        m = re.match(r"^(\d+)\s*([A-Za-z]*)$", default)
+    n = max(1, int(m.group(1)))
+    u = _norm_unit(m.group(2))
+    # store stays compact ('15m', what the user types); human/systemd spell
+    # minutes as 'min' so the display reads '15min', not '15mm'/'15m'.
+    return {"store": f"{n}{u}", "systemd": f"{n}{_DUR_SYS[u]}",
+            "seconds": n * _DUR_SECS[u], "human": f"{n}{_DUR_SYS[u]}"}
+
+
+def _unit_base(name: str) -> str:
+    return f"osync-dash-{_slug(name)}"
+
+
+def have_systemd() -> bool:
+    return bool(shutil.which("systemctl"))
+
+
+def _systemctl(*args, timeout=15) -> tuple[int, str]:
+    return run(["systemctl", "--user", *args], timeout=timeout)
+
+
+def auto_mode(conn: dict) -> str:
+    m = conn.get("auto", "off")
+    return m if m in AUTO_MODES else "off"
+
+
+def _write_units(name: str, mode: str, interval: int, conf: str) -> None:
+    base = _unit_base(name)
+    svc, tmr = SYSTEMD_USER_DIR / f"{base}.service", SYSTEMD_USER_DIR / f"{base}.timer"
+    # tear the old pair down first, whatever it was
+    _systemctl("disable", "--now", f"{base}.timer")
+    _systemctl("disable", "--now", f"{base}.service")
+    for f in (svc, tmr):
+        if f.exists():
+            f.unlink()
+    SYSTEMD_USER_DIR.mkdir(parents=True, exist_ok=True)
+    if mode == "change":
+        svc.write_text(_SVC_CHANGE.format(name=name, osync=OSYNC_BIN, conf=conf))
+        _systemctl("daemon-reload")
+        _systemctl("enable", "--now", f"{base}.service")
+    elif mode == "periodic":
+        svc.write_text(_SVC_ONESHOT.format(name=name, osync=OSYNC_BIN, conf=conf))
+        tmr.write_text(_TIMER.format(name=name, interval=parse_duration(interval)["systemd"]))
+        _systemctl("daemon-reload")
+        _systemctl("enable", "--now", f"{base}.timer")
+    else:
+        _systemctl("daemon-reload")
+
+
+def set_auto(name: str, mode: str, interval: int | None = None) -> tuple[str, str]:
+    """Persist a connection's auto mode in the compose file and (re)configure
+    its systemd --user units. Returns (mode, human message)."""
+    if mode not in AUTO_MODES:
+        mode = "off"
+    defaults, conns = parse_compose()
+    conn = next((c for c in conns if c.get("name") == name), None)
+    if not conn:
+        return "off", "connection not found"
+    conn["auto"] = mode
+    if interval:
+        conn["interval"] = parse_duration(interval)["store"]
+    dump_compose(defaults, conns)
+    if not have_systemd():
+        return mode, f"auto = {mode} saved (no systemctl — start osync yourself)"
+    if mode == "change" and not shutil.which("inotifywait"):
+        return mode, "on-change needs inotify-tools (inotifywait) installed"
+    conf = str(materialize(conn, defaults))
+    try:
+        _write_units(name, mode, conn.get("interval", "15m"), conf)
+    except Exception as e:  # noqa: BLE001
+        return mode, f"auto = {mode}, but unit setup failed: {e}"
+    every = f" (every {parse_duration(conn.get('interval', '15m'))['human']})" if mode == "periodic" else ""
+    return mode, f"auto sync: {AUTO_LABEL[mode]}{every}"
+
+
+def cycle_auto(name: str) -> tuple[str, str]:
+    defaults, conns = parse_compose()
+    conn = next((c for c in conns if c.get("name") == name), None)
+    if not conn:
+        return "off", "connection not found"
+    cur = auto_mode(conn)
+    return set_auto(name, AUTO_MODES[(AUTO_MODES.index(cur) + 1) % len(AUTO_MODES)])
+
+
+def auto_active(name: str) -> bool:
+    """Is the connection's auto unit currently active? (cheap best-effort)"""
+    if not have_systemd():
+        return False
+    base = _unit_base(name)
+    for unit in (f"{base}.timer", f"{base}.service"):
+        rc, out = _systemctl("is-active", unit, timeout=6)
+        if out.strip() == "active":
+            return True
+    return False
+
+
+def migrate_legacy() -> bool:
+    """One-time: if there's no compose yet but standalone *.conf files exist,
+    fold them into the compose file. Leaves the old confs in place."""
+    if COMPOSE_FILE.exists():
+        return False
+    legacy = list_configs()
+    if not legacy:
+        return False
+    conns = []
+    for p in legacy:
+        c = parse_config(p)
+        t = parse_target(c.get("TARGET_SYNC_DIR", ""))
+        conns.append({
+            "name": c.get("INSTANCE_ID", p.stem),
+            "local": c.get("INITIATOR_SYNC_DIR", "~"),
+            "remote": c.get("DASH_TARGET_PATH", "") or t.get("path", "~"),
+            "direction": direction_of(c),
+            "mode": c.get("DASH_ENDPOINT_MODE", "") or "ts",
+            "user": c.get("DASH_TARGET_USER", "") or t.get("user", ""),
+            "key": c.get("SSH_RSA_PRIVATE_KEY", "") or "~/.ssh/id_ed25519",
+            "ts_host": c.get("DASH_TS_HOST", "") or (t.get("host", "") if not c.get("DASH_SSH_HOST") else ""),
+            "ts_port": int(c.get("DASH_TS_PORT", "22") or 22),
+            "ssh_host": c.get("DASH_SSH_HOST", ""),
+            "ssh_port": int(c.get("DASH_SSH_PORT", "22") or 22),
+            "exclude": c.get("RSYNC_EXCLUDE_PATTERN", ""),
+        })
+    dump_compose(dict(COMPOSE_DEFAULTS), conns)
+    return True
 
 
 # ── directory listing (for the add-host autocomplete) ────────────────────────
@@ -844,10 +1211,28 @@ def main():
             sys.exit(f"osync-dash: unknown option {a} (see --help)")
         i += 1
 
-    cfg_path = pick_config(o["config"])
-    cfg, tgt = load(cfg_path)
+    # Connections come from the compose file. -c NAME|PATH narrows to one:
+    # a name matches a compose connection; a path loads a standalone .conf.
+    if o["config"] and os.path.exists(os.path.expanduser(o["config"])):
+        cfg, tgt = load(Path(os.path.expanduser(o["config"])))
+        conns = [(cfg.get("INSTANCE_ID", "?"), cfg, tgt)]
+    else:
+        conns = load_all()
+        if o["config"]:
+            conns = [c for c in conns if c[0] == o["config"]] or conns
+    if not conns:
+        sys.exit(f"osync-dash: no connections. Add one in {COMPOSE_FILE} "
+                 f"or launch the TUI and press 'a'.")
+
+    def one_shot(cfg, tgt, pending=False):
+        state, local, remote = gather(cfg, tgt, o["local_only"])
+        if pending:
+            print(f"{GREY}computing pending changes (dry run)…{RESET}", flush=True)
+            state["pending"] = compute_pending(cfg["_configfile"])
+        return render(cfg, tgt, state, local, remote, term_width())
 
     if o["log"]:
+        _, cfg, _ = conns[0]
         logf = os.path.expanduser(cfg.get("LOGFILE", ""))
         if logf and os.path.exists(logf):
             subprocess.run([os.environ.get("PAGER", "less"), "+G", logf])
@@ -855,23 +1240,20 @@ def main():
             sys.exit("osync-dash: no log file found")
         return
 
-    def one_shot(pending=False):
-        state, local, remote = gather(cfg, tgt, o["local_only"])
-        if pending:
-            print(f"{GREY}computing pending changes (dry run)…{RESET}", flush=True)
-            state["pending"] = compute_pending(cfg_path)
-        return render(cfg, tgt, state, local, remote, term_width())
-
-    # --sync is a one-off action: run, print the result, exit.
+    # --sync is a one-off action on the first (or -c selected) connection.
     if o["sync"]:
-        print(f"{CYAN}▶ running osync {cfg.get('INSTANCE_ID','')}…{RESET}\n")
-        subprocess.run([OSYNC_BIN, str(cfg_path), "--summary", "--no-prefix"] + passthru)
-        print("\n" + one_shot(pending=not o["fast"]))
+        name, cfg, tgt = conns[0]
+        print(f"{CYAN}▶ running osync {name}…{RESET}\n")
+        subprocess.run([OSYNC_BIN, cfg["_configfile"], "--summary", "--no-prefix"] + passthru)
+        print("\n" + one_shot(cfg, tgt, pending=not o["fast"]))
         return
 
     # osync_core only does the one-shot render; the interactive TUI lives in
     # osync_tui.py (Textual) and is launched by the osync-dash wrapper.
-    print(one_shot(pending=(o["check"] or not o["fast"])))
+    for i, (_, cfg, tgt) in enumerate(conns):
+        if i:
+            print()
+        print(one_shot(cfg, tgt, pending=(o["check"] or not o["fast"])))
 
 
 if __name__ == "__main__":

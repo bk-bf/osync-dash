@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """osync-dash — Textual TUI front-end (ayu-themed, btop-inspired).
 
-Launched by the `osync-dash` wrapper under the project virtualenv. All data
-gathering + config management lives in osync_core; this is presentation only.
+One compose file (~/.config/osync/osync-dash.toml) defines many sync
+connections; each is rendered as its own always-expanded card. Data gathering
+and compose management live in osync_core; this module is presentation only.
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ from rich.table import Table  # noqa: E402
 from rich.text import Text  # noqa: E402
 from textual import on, work  # noqa: E402
 from textual.app import App, ComposeResult  # noqa: E402
-from textual.containers import Grid, Horizontal, Vertical, VerticalScroll  # noqa: E402
+from textual.containers import Horizontal, Vertical, VerticalScroll  # noqa: E402
 from textual.screen import ModalScreen  # noqa: E402
 from textual.theme import Theme  # noqa: E402
 from textual.widgets import (Button, Footer, Header, Input, Label, OptionList,  # noqa: E402
@@ -35,11 +36,9 @@ LINE, MUTED, WHITE = "#565B66", "#8A909E", "#E6E4DE"
 # health colour-name (core.health) -> ayu hex
 HC = {"green": MINT, "yellow": GOLD, "red": SALMON, "blue": BLUE,
       "cyan": MINT, "grey": MUTED, "white": FG, "magenta": LAV}
-# per-panel accent
-ACCENT = {"health": GOLD, "devices": MINT, "state": LAV,
-          "paths": TAN, "safety": SALMON, "pending": BLUE}
 # osync's internal role names -> friendly local/remote (GitHub/Dropbox style)
 ROLE = {"initiator": "local", "target": "remote"}
+SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 AYU = Theme(
     name="ayu", primary=GOLD, secondary=MINT, accent=LAV, foreground=FG,
@@ -57,10 +56,6 @@ AYU = Theme(
 # ── helpers ──────────────────────────────────────────────────────────────────
 def _n(v, dash="—"):
     return dash if v is None else str(v)
-
-
-def _hs(v):
-    return core.humansize(v) if v is not None else "—"
 
 
 def _interp(a, b, t):
@@ -83,185 +78,206 @@ def grad_bar(frac, width, c1, c2, bg=LINE) -> Text:
     return t
 
 
-# ── renderables ──────────────────────────────────────────────────────────────
-def health_render(cfg, state, local, remote) -> Text:
-    st, cname = core.health(state, remote, local)
-    c = HC.get(cname, FG)
-    age = core.human_age(core.time.time() - state["last_ts"] if state["last_ts"] else None)
-    stype = cfg.get("SYNC_TYPE", "").strip() or "bidirectional"
-    t = Text()
-    t.append("● ", style=f"bold {c}")
-    t.append(st, style=f"bold {c}")
-    if state["running"]:
-        t.append("   ⟳ sync running", style=BLUE)
-    t.append("      last sync ", style=MUTED)
-    t.append(age, style=WHITE)
-    t.append("      mode ", style=MUTED)
-    t.append(stype, style=WHITE)
-    return t
+MODE_LABEL = {"ts": ("Tailscale", MINT), "ssh": ("plain SSH", GOLD),
+              "both": ("both · TS→SSH", BLUE), "": ("", MUTED)}
+DIR_LABEL = {"send": ("→ send to remote", GOLD), "receive": ("← receive from remote", BLUE),
+             "bidir": ("⇄ bidirectional", MINT)}
+DIR_ARROW = {"send": "→", "receive": "←", "bidir": "⇄"}
 
 
-def device_block(role, r, accent) -> Group:
+# ── card renderables ─────────────────────────────────────────────────────────
+def device_line(role, r, accent) -> Group:
+    """One replica: identity row + a stats/disk row underneath."""
     reach = r.get("reach", False)
     host = r.get("host") or (r.get("ts") or {}).get("name") or "—"
-    l1 = Text()
+    l1 = Text("  ")
     l1.append("▎", style=accent)
-    l1.append(f" {role:<9} ", style=f"bold {accent}")
+    l1.append(f" {role:<7} ", style=f"bold {accent}")
     l1.append(host, style=f"bold {WHITE}")
+    l1.append("   ● " + ("online" if reach else "offline"),
+              style=MINT if reach else SALMON)
+    l1.append("   rsync ", style=MUTED)
+    l1.append("✓" if r.get("rsync") else ("—" if not reach else "✗"),
+              style=MINT if r.get("rsync") else MUTED)
     ts = r.get("ts")
     if ts and ts.get("name"):
         l1.append(f"   ↳ {ts['name']}", style=MUTED)
         if ts.get("ip"):
             l1.append(f" · {ts['ip']}", style=LINE)
-    l2 = Text("   ")
-    l2.append("● online" if reach else "● offline", style=MINT if reach else SALMON)
-    l2.append("    rsync ", style=MUTED)
-    l2.append("✓" if r.get("rsync") else ("—" if not reach else "✗"), style=MINT if r.get("rsync") else MUTED)
+    rows = [l1]
+    dt, du = r.get("disk_total"), r.get("disk_used")
+    l2 = Text("    ")
     if r.get("files") is not None:
-        l2.append(f"    {r['files']} files", style=FG)
+        l2.append(f"{r['files']} files", style=FG)
     if r.get("size") is not None:
         l2.append(f" · {core.humansize(r['size'])}", style=MUTED)
-    rows = [l1, l2]
-    dt, du = r.get("disk_total"), r.get("disk_used")
     if dt and du is not None and dt > 0:
         frac = du / dt
-        l3 = Text("   disk ")
-        l3.append("▕", style=LINE)
-        l3.append_text(grad_bar(frac, 22, MINT, GREEN))
-        l3.append("▏", style=LINE)
-        l3.append(f" {frac*100:.0f}%", style=MINT)
-        l3.append(f"   {core.humansize(du)} used · {core.humansize(r.get('free'))} free", style=MUTED)
-        rows.append(l3)
+        l2.append("    disk ", style=MUTED)
+        l2.append_text(grad_bar(frac, 18, MINT, GREEN))
+        l2.append(f" {frac*100:.0f}%", style=MINT)
+        l2.append(f"  {core.humansize(r.get('free'))} free", style=MUTED)
+    if len(l2.plain.strip()):
+        rows.append(l2)
     return Group(*rows)
 
 
-def devices_render(cfg, tgt, local, remote) -> Group:
-    parts = [device_block("local", local, MINT), Text(""),
-             device_block("remote", remote if tgt.get("remote") else local, GOLD)]
-    if tgt.get("remote") and not remote.get("reach", False):
-        parts.append(Text(f"   ! {remote.get('err', 'unreachable')}", style=SALMON))
-    return Group(*parts)
+def pushpull_line(cfg, state, pending, pending_running, spin) -> Text:
+    """↑push / ↓pull legs — spin while a sync runs, else show queued counts."""
+    running = state.get("running")
+    d = core.direction_of(cfg)
+    frame = SPIN[spin % len(SPIN)]
+    push_active = running and d in ("send", "bidir")
+    pull_active = running and d in ("receive", "bidir")
+
+    def leg(active, arrow, label, cnt):
+        s = Text()
+        if active:
+            s.append(f"{frame} ", style=GOLD)
+            s.append(f"{label} ", style=f"bold {GOLD}")
+            s.append("transferring…", style=GOLD)
+        else:
+            hot = bool(cnt)
+            s.append(f"{arrow} ", style=BLUE if hot else MUTED)
+            s.append(f"{label} ", style=MUTED)
+            if pending_running:
+                s.append("checking…", style=MUTED)
+            elif cnt is None:
+                s.append("—", style=LINE)
+            elif hot:
+                s.append(f"{cnt} queued", style=BLUE)
+            else:
+                s.append("idle", style=MINT)
+        return s
+
+    push = None if pending is None else pending["tu"] + pending["td"]
+    pull = None if pending is None else pending["iu"] + pending["id"]
+    t = Text("  ")
+    t.append_text(leg(push_active, "↑", "push", push))
+    t.append("        ")
+    t.append_text(leg(pull_active, "↓", "pull", pull))
+    return t
 
 
-def _kv(rows) -> Table:
-    t = Table(box=None, expand=True, show_header=False, pad_edge=False)
-    t.add_column(style=MUTED, no_wrap=True, width=13)
+def _kv(rows, kw=11) -> Table:
+    t = Table(box=None, expand=True, show_header=False, pad_edge=False, padding=(0, 0, 0, 2))
+    t.add_column(style=MUTED, no_wrap=True, width=kw)
     t.add_column(ratio=1)
     for k, v in rows:
         t.add_row(k, v)
     return t
 
 
-def state_render(cfg, state) -> Table:
-    res = state.get("init_action") or "—"
-    rc = MINT if res == "synced" else (MUTED if res == "—" else SALMON)
-    resume = state.get("resume")
+def card_body(name, cfg, tgt, data, pending, pending_running, spin) -> Group:
+    if data is None:
+        return Group(Text("  gathering…", style=MUTED))
+    state, local, remote = data
+    st, cname = core.health(state, remote, local)
+    c = HC.get(cname, FG)
+    age = core.human_age(core.time.time() - state["last_ts"] if state["last_ts"] else None)
     lastrun = (core.time.strftime("%Y-%m-%d %H:%M", core.time.localtime(state["last_ts"]))
                if state["last_ts"] else "never")
-    age = core.human_age(core.time.time() - state["last_ts"] if state["last_ts"] else None)
+
+    # header: health · last-sync · result
+    res = state.get("init_action") or "—"
+    rc = MINT if res == "synced" else (MUTED if res == "—" else SALMON)
     ta = state.get("tgt_action")
-    result = Text(res, style=rc)
-    result.append("   remote ", style=MUTED)
-    result.append(_n(ta), style=MINT if ta == "synced" else MUTED)
-    return _kv([
-        ("last run", Text(f"{lastrun}  ({age} ago)", style=WHITE)),
-        ("result", result),
-        ("resume", Text("0 clean", style=MINT) if resume in ("0", None) else Text(f"{resume} retried", style=SALMON)),
-        ("running", Text("yes", style=BLUE) if state["running"] else Text("no", style=MUTED)),
-    ])
+    resume = state.get("resume")
+    hdr = Text("  ")
+    hdr.append("● ", style=f"bold {c}")
+    hdr.append(st, style=f"bold {c}")
+    if state["running"]:
+        hdr.append(f"  {SPIN[spin % len(SPIN)]} running", style=BLUE)
+    hdr.append(f"    last sync {age} ago", style=MUTED)
+    hdr.append(f"  ({lastrun})", style=LINE)
 
+    res_t = Text("  ")
+    res_t.append("result ", style=MUTED)
+    res_t.append(res, style=rc)
+    res_t.append("  ·  remote ", style=MUTED)
+    res_t.append(_n(ta), style=MINT if ta == "synced" else MUTED)
+    res_t.append("  ·  resume ", style=MUTED)
+    res_t.append("0 clean" if resume in ("0", None) else f"{resume} retried",
+                 style=MINT if resume in ("0", None) else SALMON)
 
-MODE_LABEL = {"ts": ("Tailscale", MINT), "ssh": ("plain SSH", GOLD),
-              "both": ("both · TS→SSH", BLUE), "": ("", MUTED)}
-DIR_LABEL = {"send": ("→ send to remote", GOLD), "receive": ("← receive from remote", BLUE),
-             "bidir": ("⇄ bidirectional", MINT)}
+    dev_target = remote if tgt.get("remote") else local
+    parts = [hdr, pushpull_line(cfg, state, pending, pending_running, spin), res_t,
+             Text(""), device_line("local", local, MINT),
+             device_line("remote", dev_target, GOLD)]
+    if tgt.get("remote") and not remote.get("reach", False):
+        parts.append(Text(f"    ! {remote.get('err', 'unreachable')}", style=SALMON))
 
-
-def paths_render(cfg, tgt, remote=None) -> Table:
+    # paths + connection + safety, all inline (no collapsing)
     tgt_s = (f"{tgt.get('user','')}@{tgt.get('host','')}:{tgt.get('path','?')}"
              if tgt.get("remote") else cfg.get("TARGET_SYNC_DIR", "?"))
-    mode = core.mode_of(cfg)
-    mlabel, mcol = MODE_LABEL.get(mode, ("", MUTED))
-    conn = Text()
-    if mlabel:
-        conn.append(mlabel, style=mcol)
+    mlabel, mcol = MODE_LABEL.get(core.mode_of(cfg), ("", MUTED))
+    conn = Text(mlabel or "—", style=mcol if mlabel else MUTED)
     used = (remote or {}).get("endpoint_used")
-    if used and mode == "both":
-        conn.append(f"  · live: {'TS' if used=='ts' else 'SSH'}",
+    if used and core.mode_of(cfg) == "both":
+        conn.append(f"  · live {'TS' if used == 'ts' else 'SSH'}",
                     style=MINT if used == "ts" else GOLD)
-    dlabel, dcol = DIR_LABEL.get(core.direction_of(cfg), ("", MUTED))
-    return _kv([
-        ("local", Text(cfg.get("INITIATOR_SYNC_DIR", "?"), style=WHITE)),
-        ("remote", Text(tgt_s, style=WHITE)),
-        ("direction", Text(dlabel, style=dcol)),
-        ("connection", conn if mlabel else Text("—", style=MUTED)),
-        ("log", Text(cfg.get("LOGFILE", "—") or "—", style=MUTED)),
-        ("config", Text(cfg.get("_configfile", ""), style=MUTED)),
-    ])
 
-
-def safety_render(cfg, tgt, local, remote) -> Table:
     li, ri = local.get("deleted", 0), (remote.get("deleted") if tgt.get("remote") else local.get("deleted"))
     lb, rb = local.get("backup", 0), (remote.get("backup") if tgt.get("remote") else local.get("backup"))
     sd = cfg.get("SOFT_DELETE", "true") == "true"
     cb = cfg.get("CONFLICT_BACKUP", "true") == "true"
+    safety = Text()
+    safety.append("soft-delete ", style=MUTED)
+    safety.append("on" if sd else "off", style=MINT if sd else MUTED)
+    safety.append(f" {li}/{ri if ri is not None else '—'}", style=FG)
+    safety.append(f" {cfg.get('SOFT_DELETE_DAYS','?')}d", style=LINE)
+    safety.append("   conflict-bkp ", style=MUTED)
+    safety.append("on" if cb else "off", style=MINT if cb else MUTED)
+    safety.append(f" {lb}/{rb if rb is not None else '—'}", style=FG)
+    safety.append(f" {cfg.get('CONFLICT_BACKUP_DAYS','?')}d", style=LINE)
+    safety.append("   winner ", style=MUTED)
+    safety.append("newest", style=MINT)
 
-    def ln(on, a, b, days):
-        t = Text("on  ", style=MINT) if on else Text("off ", style=MUTED)
-        t.append(f"local {a} / remote {_n(b)}", style=FG)
-        t.append(f"   kept {days}d", style=MUTED)
-        return t
+    auto = cfg.get("_auto", "off")
+    auto_t = Text()
+    if auto == "change":
+        auto_t.append("⟳ on file change", style=MINT)
+    elif auto == "periodic":
+        auto_t.append(f"⟳ every {cfg.get('_interval', '15min')}", style=MINT)
+    else:
+        auto_t.append("off — manual (press s)", style=MUTED)
 
-    winner = Text("newest edit", style=MINT)
-    winner.append(f"   · tie → {ROLE.get(cfg.get('CONFLICT_PREVALANCE',''), 'local')}", style=MUTED)
-    rows = [("soft-delete", ln(sd, li, ri, cfg.get("SOFT_DELETE_DAYS", "?"))),
-            ("conflict-bkp", ln(cb, lb, rb, cfg.get("CONFLICT_BACKUP_DAYS", "?"))),
-            ("winner", winner)]
+    rows = [
+        ("local", Text(cfg.get("INITIATOR_SYNC_DIR", "?"), style=WHITE)),
+        ("remote", Text(tgt_s, style=WHITE)),
+        ("via", conn),
+        ("auto-sync", auto_t),
+        ("safety", safety),
+        ("log", Text(cfg.get("LOGFILE", "—") or "—", style=MUTED)),
+    ]
     excl = cfg.get("RSYNC_EXCLUDE_PATTERN", "").strip()
     if excl:
         rows.append(("excludes", Text(excl, style=GOLD)))
-    return _kv(rows)
+    parts += [Text(""), _kv(rows)]
+    return Group(*parts)
 
 
-def pending_render(pending, running) -> Text:
-    if running:
-        return Text("⟳ computing dry-run…", style=MUTED)
-    if pending is None:
-        t = Text("press ", style=MUTED)
-        t.append("c", style=f"bold {GOLD}")
-        t.append(" to check for pending changes", style=MUTED)
-        return t
-    if pending["total"] == 0:
-        return Text("✓ in sync — nothing pending", style=MINT)
-    t = Text(f"⚠ {pending['total']} pending", style=GOLD)
-    t.append(f"     ↑ to remote {pending['tu']}u / {pending['td']}d", style=MUTED)
-    t.append(f"     ↓ to local {pending['iu']}u / {pending['id']}d", style=MUTED)
-    return t
+# ── connection card widget ───────────────────────────────────────────────────
+class ConnectionCard(Static):
+    can_focus = True
+
+    def __init__(self, name, direction):
+        super().__init__(id=f"card-{core._slug(name)}")
+        self.conn_name = name
+        self.set_title(name, direction)
+
+    def set_title(self, name, direction):
+        arrow = DIR_ARROW.get(direction, "⇄")
+        self.border_title = f" {name}  {arrow} "
 
 
-# ── panel widget ─────────────────────────────────────────────────────────────
-class Panel(Static):
-    def __init__(self, title, pid, accent):
-        super().__init__(id=pid)
-        self.border_title = f" {title} "
-        self._accent = accent
-
-    def on_mount(self):
-        self.set_accent(self._accent)
-
-    def set_accent(self, color):
-        self._accent = color
-        self.styles.border = ("round", color)
-        self.styles.border_title_color = color
+# ── add-connection modal (dynamic, mesh) ─────────────────────────────────────
+MODES = [("Tailscale", "ts"), ("Plain SSH", "ssh"), ("Both", "both")]
+DIRS = [("bidir", "bidir"), ("send", "send"), ("receive", "receive")]
 
 
-# ── directory autocomplete field ─────────────────────────────────────────────
 class DirField(Vertical):
-    """Input + live dropdown of matching subdirectories (local or remote).
-
-    `resolver` None → completes local paths. Otherwise a callable returning
-    (user, host, port, key) — or None when the connection isn't set yet — and
-    the field lists remote dirs over ssh (cached per connection+parent)."""
+    """Input + live dropdown of matching subdirectories (local or remote)."""
 
     def __init__(self, fid, placeholder="", value="~/", resolver=None):
         super().__init__(id=fid, classes="dirfield")
@@ -359,67 +375,6 @@ class DirField(Vertical):
             e.stop()
 
 
-# ── host-switch popup ────────────────────────────────────────────────────────
-class HostPicker(ModalScreen):
-    """A floating list of hosts; the dashboard stays visible (dimmed) behind."""
-
-    CSS = """
-    HostPicker { align: center middle; background: $background 55%; }
-    #hp { width: 56; height: auto; max-height: 80%; padding: 1 2;
-          background: $panel; border: round $secondary; }
-    #hp .h { color: $secondary; text-style: bold; margin-bottom: 1; }
-    #hp .hint { color: $foreground-muted; margin-top: 1; }
-    OptionList { border: none; background: $panel; height: auto; max-height: 18; padding: 0; }
-    """
-    BINDINGS = [("escape", "cancel", "Cancel"), ("a", "add", "Add host")]
-
-    def __init__(self, configs, current):
-        super().__init__()
-        self.configs = configs
-        self.current = current
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="hp"):
-            yield Static("⇅ switch host", classes="h")
-            opts = []
-            for p in self.configs:
-                c = core.parse_config(p)
-                name = c.get("INSTANCE_ID", p.stem)
-                via = {"ts": "tailscale", "ssh": "ssh", "both": "ts→ssh"}.get(c.get("DASH_ENDPOINT_MODE", ""), "")
-                t = Text("● " if p == self.current else "  ",
-                         style=MINT if p == self.current else MUTED)
-                t.append(name, style=f"bold {WHITE}" if p == self.current else FG)
-                if via:
-                    t.append(f"   {via}", style=MUTED)
-                opts.append(Option(t, id=str(p)))
-            ol = OptionList(*opts, id="ol")
-            yield ol
-            yield Static("↑↓ move · enter switch · a add · esc close", classes="hint")
-
-    def on_mount(self):
-        ol = self.query_one("#ol", OptionList)
-        try:
-            ol.highlighted = next(i for i, p in enumerate(self.configs) if p == self.current)
-        except StopIteration:
-            pass
-        ol.focus()
-
-    @on(OptionList.OptionSelected)
-    def _picked(self, event: OptionList.OptionSelected):
-        self.dismiss(Path(event.option.id))
-
-    def action_cancel(self):
-        self.dismiss(None)
-
-    def action_add(self):
-        self.dismiss("__add__")
-
-
-# ── add-host modal (dynamic, mesh) ───────────────────────────────────────────
-MODES = [("Tailscale", "ts"), ("Plain SSH", "ssh"), ("Both", "both")]
-DIRS = [("bidir", "bidir"), ("send", "send"), ("receive", "receive")]
-
-
 class AddHost(ModalScreen):
     CSS = """
     AddHost { align: center middle; background: $background 55%; }
@@ -466,7 +421,7 @@ class AddHost(ModalScreen):
                 for d in self.devices]
         opts.append(("✎  manual entry", "__manual__"))
         with Vertical(id="box"):
-            yield Static("＋ add a sync host", classes="h")
+            yield Static("＋ add a sync connection", classes="h")
             yield Static("import a Tailscale device (or enter a host), then pick dirs to sync", classes="sub")
             with VerticalScroll(id="form"):
                 yield Label("device")
@@ -560,30 +515,124 @@ class AddHost(ModalScreen):
         if need:
             err.update("missing: " + ", ".join(need))
             return
+        conn = {"name": name, "local": lpath, "remote": rpath, "direction": direction,
+                "mode": mode, "user": user, "key": g("i_key"),
+                "ts_host": ts_host, "ts_port": int(g("i_tsport") or 22),
+                "ssh_host": ssh_host, "ssh_port": int(g("i_sshport") or 22)}
         try:
-            p = core.create_config(
-                instance=name, initiator_dir=lpath, user=user, path=rpath, key=g("i_key"),
-                ts_host=ts_host, ts_port=g("i_tsport") or "22",
-                ssh_host=ssh_host, ssh_port=g("i_sshport") or "22",
-                mode=mode, direction=direction)
+            core.add_connection(conn)
         except FileExistsError as e:
             err.update(str(e)); return
         except Exception as e:  # noqa: BLE001
             err.update(f"error: {e}"); return
-        self.dismiss(p)
+        self.dismiss(name)
+
+
+# ── auto-sync modal ──────────────────────────────────────────────────────────
+AUTO_PRESETS = [("1 minute", "1m"), ("5 minutes", "5m"), ("15 minutes", "15m"),
+                ("30 minutes", "30m"), ("1 hour", "1h"), ("6 hours", "6h"),
+                ("12 hours", "12h"), ("24 hours", "24h"), ("2 days", "2d"),
+                ("3 days", "3d"), ("1 week", "1w"), ("2 weeks", "2w")]
+AUTO_RADIO = [("off", "Off — manual only"),
+              ("change", "On file change  (live, inotify)"),
+              ("periodic", "Every…  (scheduled)")]
+
+
+class AutoSyncModal(ModalScreen):
+    CSS = """
+    AutoSyncModal { align: center middle; background: $background 55%; }
+    #ab { width: 64; height: auto; max-height: 90%; padding: 1 2; background: $panel;
+          border: round $secondary; }
+    #ab .h { color: $secondary; text-style: bold; }
+    #ab .sub { color: $foreground-muted; margin-bottom: 1; }
+    #ab Label { color: $foreground-muted; margin-top: 1; }
+    #ab RadioSet { border: none; height: auto; }
+    #sched { height: auto; }
+    #ab Input { border: tall $panel-lighten-2; }
+    #abtns { height: auto; align-horizontal: right; margin-top: 1; }
+    #abtns Button { margin-left: 2; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, name, cur_mode, cur_interval):
+        super().__init__()
+        self.cname = name
+        self.cur_mode = cur_mode if cur_mode in ("off", "change", "periodic") else "off"
+        self.cur_interval = cur_interval or "15m"
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ab"):
+            yield Static(f"⟳ auto-sync · {self.cname}", classes="h")
+            yield Static("how should this connection sync on its own?", classes="sub")
+            with RadioSet(id="a_mode"):
+                for key, label in AUTO_RADIO:
+                    yield RadioButton(label, value=(key == self.cur_mode))
+            with Vertical(id="sched"):
+                yield Label("run every (pick one, or type a custom interval)")
+                preset_match = next((v for _, v in AUTO_PRESETS if v == self.cur_interval), None)
+                yield Select(AUTO_PRESETS, value=preset_match or Select.BLANK,
+                             prompt="pick an interval…", id="a_preset", allow_blank=True)
+                yield Input(value="" if preset_match else self.cur_interval,
+                            placeholder="custom: 90m · 3d · 2w", id="a_custom")
+            with Horizontal(id="abtns"):
+                yield Button("Cancel", id="a_cancel")
+                yield Button("Save", variant="primary", id="a_save")
+
+    def on_mount(self):
+        self._sync_sched()
+
+    def _mode(self):
+        idx = self.query_one("#a_mode", RadioSet).pressed_index or 0
+        return AUTO_RADIO[idx][0]
+
+    def _sync_sched(self):
+        self.query_one("#sched").display = self._mode() == "periodic"
+
+    @on(RadioSet.Changed, "#a_mode")
+    def _mode_changed(self, e):
+        self._sync_sched()
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#a_cancel")
+    def _cancel(self):
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#a_save")
+    def _save(self):
+        mode = self._mode()
+        interval = None
+        if mode == "periodic":
+            custom = self.query_one("#a_custom", Input).value.strip()
+            sel = self.query_one("#a_preset", Select).value
+            interval = custom or (sel if sel != Select.BLANK else self.cur_interval)
+        self.dismiss((mode, interval))
 
 
 # ── app ──────────────────────────────────────────────────────────────────────
 class OsyncDash(App):
     CSS = """
-    Screen { background: $background; }
-    #grid { height: auto; padding: 0 1; }
-    .row { height: auto; }
-    Panel { height: auto; margin: 0 1 1 1; padding: 0 1; background: $panel; }
-    #p_health { margin: 1 1 1 1; }
-    #p_devices { width: 3fr; }
-    #p_state   { width: 2fr; }
-    #p_paths, #p_safety { width: 1fr; }
+    Screen { background: $background; scrollbar-size: 0 0; }
+    #cards {
+        height: 1fr; padding: 1 1;
+        scrollbar-size-vertical: 1;
+        scrollbar-background: $background;
+        scrollbar-background-hover: $background;
+        scrollbar-background-active: $background;
+        scrollbar-color: $background;
+        scrollbar-color-hover: $secondary;
+        scrollbar-color-active: $secondary;
+    }
+    #empty { height: auto; padding: 2 3; color: $foreground-muted; }
+    ConnectionCard {
+        height: auto; margin: 0 0 1 0; padding: 1 1; background: $panel;
+        border: round $panel-lighten-2; border-title-color: $foreground-muted;
+    }
+    ConnectionCard:focus {
+        border: round $secondary; border-title-color: $secondary;
+        background: $boost;
+    }
     """
     BINDINGS = [
         ("r", "refresh", "Refresh"),
@@ -591,121 +640,160 @@ class OsyncDash(App):
         ("s", "sync", "Sync"),
         ("t", "cycle_mode", "Endpoint"),
         ("d", "cycle_direction", "Direction"),
-        ("n", "next_host", "Host"),
+        ("A", "auto_sync", "Auto-sync"),
         ("a", "add_host", "Add"),
         ("l", "log", "Log"),
+        ("down,j", "focus_next_card", "Next"),
+        ("up,k", "focus_prev_card", "Prev"),
         ("q", "quit", "Quit"),
     ]
 
-    def __init__(self, cfg_path, local_only=False, interval=6, want_pending=True):
+    def __init__(self, local_only=False, interval=6, want_pending=True):
         super().__init__()
-        self.configs = core.list_configs()
-        self.cfg_path = Path(cfg_path)
-        if self.cfg_path not in self.configs and self.cfg_path.exists():
-            self.configs.append(self.cfg_path)
         self.local_only = local_only
         self.interval = max(2, interval)
         self.want_pending = want_pending
-        self.data = None
-        self.pending = None
-        self.pending_running = False
-        self._load_cfg()
+        self.conns = []                # [(name, cfg, tgt)]
+        self.data = {}                 # name -> (state, local, remote)
+        self.pending = {}              # name -> pending dict | None
+        self.pending_running = {}      # name -> bool
+        self._spin = 0
+        self._load_compose()
 
-    def _load_cfg(self):
-        self.cfg, self.tgt = core.load(self.cfg_path)
+    def _load_compose(self):
+        self.conns = core.load_all()
         self.title = "osync-dash"
-        mode = core.mode_of(self.cfg)
-        via = {"ts": " · Tailscale", "ssh": " · SSH", "both": " · TS→SSH"}.get(mode, "")
-        arrow = {"send": " →", "receive": " ←", "bidir": " ⇄"}.get(core.direction_of(self.cfg), "")
-        self.sub_title = f"{self.cfg.get('INSTANCE_ID','?')}{via}{arrow}"
+        n = len(self.conns)
+        self.sub_title = f"{n} connection{'' if n == 1 else 's'}"
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        with VerticalScroll(id="grid"):
-            yield Panel("health", "p_health", GOLD)
-            with Horizontal(classes="row"):
-                yield Panel("devices", "p_devices", MINT)
-                yield Panel("sync state", "p_state", LAV)
-            with Horizontal(classes="row"):
-                yield Panel("paths", "p_paths", TAN)
-                yield Panel("safety net", "p_safety", SALMON)
-            yield Panel("pending", "p_pending", BLUE)
+        yield VerticalScroll(id="cards")
         yield Footer()
 
     def on_mount(self):
         self.register_theme(AYU)
         self.theme = "ayu"
-        for pid in ("p_health", "p_devices", "p_state", "p_paths", "p_safety"):
-            self.query_one(f"#{pid}", Panel).update(Text("gathering…", style=MUTED))
-        self.query_one("#p_pending", Panel).update(pending_render(None, False))
-        self.refresh_data()
-        if self.want_pending:
-            self.check_pending()
-        self.set_interval(self.interval, self.refresh_data)
+        self._build_cards()
+        self.set_interval(self.interval, self.action_refresh)
+        self.set_interval(0.12, self._tick)
+
+    # cards ---------------------------------------------------------------
+    def _build_cards(self):
+        box = self.query_one("#cards", VerticalScroll)
+        box.remove_children()
+        if not self.conns:
+            box.mount(Static(
+                "No sync connections yet.\n\n"
+                "Press  a  to add one — it lands in ~/.config/osync/osync-dash.toml.",
+                id="empty"))
+            return
+        first = None
+        for name, cfg, _ in self.conns:
+            card = ConnectionCard(name, core.direction_of(cfg))
+            box.mount(card)
+            card.update(Text("  gathering…", style=MUTED))
+            first = first or card
+        for name, cfg, tgt in self.conns:
+            self.refresh_one(name, cfg, tgt)
+            if self.want_pending:
+                self.check_pending(name)
+        if first:
+            first.focus()
+
+    def _card(self, name) -> ConnectionCard | None:
+        try:
+            return self.query_one(f"#card-{core._slug(name)}", ConnectionCard)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _render_card(self, name):
+        card = self._card(name)
+        if not card:
+            return
+        cfg, tgt = next(((c, t) for n, c, t in self.conns if n == name), (None, None))
+        if cfg is None:
+            return
+        card.update(card_body(name, cfg, tgt, self.data.get(name),
+                              self.pending.get(name), self.pending_running.get(name, False),
+                              self._spin))
+
+    def _tick(self):
+        """Advance the spinner; only re-render cards that are actively working."""
+        self._spin += 1
+        for name in list(self.data):
+            busy = self.pending_running.get(name) or \
+                (self.data.get(name) and self.data[name][0].get("running"))
+            if busy:
+                self._render_card(name)
 
     # workers -------------------------------------------------------------
-    @work(thread=True, exclusive=True, group="refresh")
-    def refresh_data(self):
+    @work(thread=True, group="refresh", exclusive=False)
+    def refresh_one(self, name, cfg, tgt):
         try:
-            data = core.gather(self.cfg, self.tgt, self.local_only)
+            data = core.gather(cfg, tgt, self.local_only)
         except Exception as e:  # noqa: BLE001
-            self.call_from_thread(self.notify, f"refresh failed: {e}", severity="error")
+            self.call_from_thread(self.notify, f"{name}: refresh failed: {e}", severity="error")
             return
-        self.call_from_thread(self._apply, data)
+        self.call_from_thread(self._apply, name, data)
 
-    @work(thread=True, exclusive=True, group="pending")
-    def check_pending(self):
-        self.pending_running = True
-        self.call_from_thread(self._apply_pending)
+    @work(thread=True, group="pending", exclusive=False)
+    def check_pending(self, name):
+        cfg = next((c for n, c, _ in self.conns if n == name), None)
+        if cfg is None:
+            return
+        self.pending_running[name] = True
+        self.call_from_thread(self._render_card, name)
         try:
-            p = core.compute_pending(self.cfg_path)
+            p = core.compute_pending(cfg["_configfile"])
         except Exception:  # noqa: BLE001
             p = None
-        self.pending_running = False
-        self.pending = p
-        self.call_from_thread(self._apply_pending)
+        self.pending_running[name] = False
+        self.pending[name] = p
+        self.call_from_thread(self._render_card, name)
 
-    # ui updates ----------------------------------------------------------
-    def _apply(self, data):
-        self.data = data
-        state, local, remote = data
-        _, cname = core.health(state, remote, local)
-        h = self.query_one("#p_health", Panel)
-        h.set_accent(HC.get(cname, FG))
-        h.update(health_render(self.cfg, state, local, remote))
-        self.query_one("#p_devices", Panel).update(devices_render(self.cfg, self.tgt, local, remote))
-        self.query_one("#p_state", Panel).update(state_render(self.cfg, state))
-        self.query_one("#p_paths", Panel).update(paths_render(self.cfg, self.tgt, remote))
-        self.query_one("#p_safety", Panel).update(safety_render(self.cfg, self.tgt, local, remote))
-
-    def _apply_pending(self):
-        p = self.query_one("#p_pending", Panel)
-        p.update(pending_render(self.pending, self.pending_running))
-        if not self.pending_running and self.pending is not None:
-            p.set_accent(MINT if self.pending["total"] == 0 else GOLD)
+    def _apply(self, name, data):
+        self.data[name] = data
+        self._render_card(name)
 
     # actions -------------------------------------------------------------
+    def _focused_name(self):
+        f = self.focused
+        if isinstance(f, ConnectionCard):
+            return f.conn_name
+        return self.conns[0][0] if self.conns else None
+
     def action_refresh(self):
-        self.refresh_data()
+        for name, cfg, tgt in self.conns:
+            self.refresh_one(name, cfg, tgt)
 
     def action_check(self):
-        self.check_pending()
+        name = self._focused_name()
+        if name:
+            self.check_pending(name)
 
     def action_sync(self):
+        name = self._focused_name()
+        cfg = next((c for n, c, _ in self.conns if n == name), None)
+        if not cfg:
+            return
         with self.suspend():
             os.system("clear")
-            print(f"\033[38;2;230;180;80m▶ Running osync — {self.cfg.get('INSTANCE_ID','')}\033[0m\n")
-            subprocess.run([core.OSYNC_BIN, str(self.cfg_path), "--summary", "--no-prefix"])
+            print(f"\033[38;2;230;180;80m▶ Running osync — {name}\033[0m\n")
+            subprocess.run([core.OSYNC_BIN, cfg["_configfile"], "--summary", "--no-prefix"])
             try:
                 input("\n[done] Press Enter to return… ")
             except EOFError:
                 pass
-        self.refresh_data()
+        tgt = next((t for n, _, t in self.conns if n == name), None)
+        self.refresh_one(name, cfg, tgt)
         if self.want_pending:
-            self.check_pending()
+            self.check_pending(name)
 
     def action_log(self):
-        logf = os.path.expanduser(self.cfg.get("LOGFILE", "") or "")
+        name = self._focused_name()
+        cfg = next((c for n, c, _ in self.conns if n == name), None)
+        logf = os.path.expanduser((cfg or {}).get("LOGFILE", "") or "")
         if not (logf and os.path.exists(logf)):
             self.notify("no log file found", severity="warning")
             return
@@ -713,53 +801,87 @@ class OsyncDash(App):
             subprocess.run([os.environ.get("PAGER", "less"), "+G", logf])
 
     def action_cycle_mode(self):
-        new, msg = core.cycle_mode(self.cfg_path)
+        name = self._focused_name()
+        if not name:
+            return
+        new, msg = core.cycle_mode_conn(name)
         if not new:
             self.notify(msg, severity="warning")
             return
-        self._load_cfg()
+        self._reload_conn(name)
         self.notify(msg, severity="information")
-        self.refresh_data()
+        self.refresh_one(*self._triple(name))
 
     def action_cycle_direction(self):
+        name = self._focused_name()
+        cfg = next((c for n, c, _ in self.conns if n == name), None)
+        if not cfg:
+            return
         order = ["bidir", "send", "receive"]
-        cur = core.direction_of(self.cfg)
+        cur = core.direction_of(cfg)
         new = order[(order.index(cur) + 1) % 3] if cur in order else "bidir"
-        core.set_direction(self.cfg_path, new)
-        self._load_cfg()
+        core.set_direction_conn(name, new)
+        self._reload_conn(name)
+        card = self._card(name)
+        if card:
+            card.set_title(name, new)
         self.notify(f"direction: {DIR_LABEL[new][0]}", severity="information")
-        self.refresh_data()
+        self._render_card(name)
 
-    def _switch_to(self, path, msg=None):
-        self.cfg_path = Path(path)
-        self._load_cfg()
-        if msg:
-            self.notify(msg, severity="information")
-        self.refresh_data()
-        if self.want_pending:
-            self.check_pending()
-
-    def action_next_host(self):
-        self.configs = core.list_configs() or self.configs
-        self.push_screen(HostPicker(self.configs, self.cfg_path), self._picked_host)
-
-    def _picked_host(self, result):
-        if result is None:
+    def action_auto_sync(self):
+        name = self._focused_name()
+        cfg = next((c for n, c, _ in self.conns if n == name), None)
+        if not cfg:
             return
-        if result == "__add__":
-            self.action_add_host()
+        self.push_screen(
+            AutoSyncModal(name, cfg.get("_auto", "off"), cfg.get("_interval", "15m")),
+            lambda res: self._apply_auto(name, res))
+
+    def _apply_auto(self, name, res):
+        if res is None:
             return
-        if Path(result) != self.cfg_path:
-            self._switch_to(result, f"→ {core.parse_config(Path(result)).get('INSTANCE_ID','?')}")
+        mode, interval = res
+        self.notify("configuring auto-sync…", timeout=2)
+        self._do_set_auto(name, mode, interval)
+
+    @work(thread=True, group="auto", exclusive=False)
+    def _do_set_auto(self, name, mode, interval):
+        _, msg = core.set_auto(name, mode, interval)
+        self.call_from_thread(self._after_auto, name, msg)
+
+    def _after_auto(self, name, msg):
+        self._reload_conn(name)
+        self.notify(msg, severity="information")
+        self._render_card(name)
+
+    def action_focus_next_card(self):
+        self.screen.focus_next()
+
+    def action_focus_prev_card(self):
+        self.screen.focus_previous()
 
     def action_add_host(self):
         self.push_screen(AddHost(core.ts_devices()), self._added)
 
-    def _added(self, path):
-        if not path:
+    def _added(self, name):
+        if not name:
             return
-        self.configs = core.list_configs()
-        self._switch_to(path, f"created host '{core.parse_config(Path(path)).get('INSTANCE_ID','?')}'")
+        self._load_compose()
+        self._build_cards()
+        self.notify(f"created connection '{name}'", severity="information")
+
+    # helpers -------------------------------------------------------------
+    def _triple(self, name):
+        return next(((n, c, t) for n, c, t in self.conns if n == name), (name, None, None))
+
+    def _reload_conn(self, name):
+        defaults, conns = core.parse_compose()
+        conn = next((c for c in conns if c.get("name") == name), None)
+        if not conn:
+            return
+        cfg, tgt = core.connection_to_cfg(conn, defaults)
+        self.conns = [(n, cfg, tgt) if n == name else (n, c, t)
+                      for n, c, t in self.conns]
 
 
 def parse_args(argv):
@@ -781,8 +903,7 @@ def parse_args(argv):
 
 def main():
     o = parse_args(sys.argv[1:])
-    cfg_path = core.pick_config(o["config"])
-    OsyncDash(cfg_path, local_only=o["local_only"], interval=o["interval"],
+    OsyncDash(local_only=o["local_only"], interval=o["interval"],
               want_pending=not o["fast"]).run()
 
 
