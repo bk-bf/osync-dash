@@ -1395,6 +1395,96 @@ def ts_devices() -> list[dict]:
     return devs
 
 
+# ── mesh beacons: advertise this node's pushes so peers can see them ─────────
+# A push connection drops a small beacon in the target's ~/.config/osync/incoming
+# over ssh. The receiving node reads those to show "← from <node>" cards — a
+# decentralised netmap, no central registry. Liveness comes from osync's own
+# target-side state mtime, so beacons stay static metadata.
+INCOMING_DIR = CONFIG_HOME / "incoming"
+_REMOTE_INCOMING = "~/.config/osync/incoming"
+
+
+def _beacon_name(node: str, conn_name: str) -> str:
+    return f"{_slug(node)}--{_slug(conn_name)}.toml"
+
+
+def node_name() -> str:
+    return parse_settings().get("node") or socket.gethostname()
+
+
+def advertise(conn: dict, defaults: dict) -> bool:
+    """Drop/refresh a beacon on a push target. Best-effort; push only."""
+    if conn.get("direction", "bidir") != "send":
+        return False
+    try:
+        cfg, tgt = connection_to_cfg(conn, defaults)
+    except Exception:  # noqa: BLE001
+        return False
+    if not tgt.get("remote"):
+        return False
+    body = (f'from_node = {_toml_val(node_name())}\n'
+            f'connection = {_toml_val(conn["name"])}\n'
+            f'source_dir = {_toml_val(os.path.expanduser(conn.get("local", "")))}\n'
+            f'dir = {_toml_val(tgt.get("path", ""))}\n'
+            'direction = "send"\n')
+    name = _beacon_name(node_name(), conn["name"])
+    cmd = ssh_prefix(cfg, tgt) + [f"mkdir -p {_REMOTE_INCOMING} && cat > {_REMOTE_INCOMING}/{name}"]
+    try:
+        return subprocess.run(cmd, input=body, text=True, capture_output=True,
+                              timeout=15).returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def unadvertise(conn: dict, defaults: dict) -> None:
+    try:
+        cfg, tgt = connection_to_cfg(conn, defaults)
+    except Exception:  # noqa: BLE001
+        return
+    if not tgt.get("remote"):
+        return
+    name = _beacon_name(node_name(), conn["name"])
+    try:
+        subprocess.run(ssh_prefix(cfg, tgt) + [f"rm -f {_REMOTE_INCOMING}/{name}"],
+                       capture_output=True, timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def advertise_all() -> None:
+    defaults, conns = parse_compose()
+    for c in conns:
+        if c.get("direction") == "send":
+            advertise(c, defaults)
+
+
+def incoming_beacons() -> list[dict]:
+    if not INCOMING_DIR.is_dir():
+        return []
+    out = []
+    for p in sorted(INCOMING_DIR.glob("*.toml")):
+        try:
+            with open(p, "rb") as f:
+                b = tomllib.load(f)
+        except (tomllib.TOMLDecodeError, OSError):
+            continue
+        if b.get("from_node") and b.get("dir"):
+            out.append(b)
+    return out
+
+
+def probe_incoming(beacon: dict) -> dict:
+    """Status of one incoming push, seen from THIS (receiving) node's side."""
+    d = Path(os.path.expanduser(beacon.get("dir", "")))
+    inst = beacon.get("connection", "")
+    last_ts = _state_mtime(d / OSYNC_DIR / "state" / f"target-last-action-{inst}")
+    info = probe_local(d) if d.is_dir() else {"reach": False, "files": None, "size": None}
+    return {"from_node": beacon.get("from_node", "?"), "connection": inst,
+            "dir": str(d), "source_dir": beacon.get("source_dir", ""),
+            "last_ts": last_ts, "files": info.get("files"), "size": info.get("size"),
+            "reach": info.get("reach", False)}
+
+
 def gather(cfg, tgt, local_only=False):
     sync_dir = Path(os.path.expanduser(cfg.get("INITIATOR_SYNC_DIR", "")))
     # baseline = last successful sync time; both replicas were identical then, so

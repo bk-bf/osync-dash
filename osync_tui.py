@@ -303,6 +303,34 @@ class ConnectionCard(Static):
         self.border_title = f" {name}  {arrow} "
 
 
+class IncomingCard(Static):
+    """Read-only card for a push arriving from a peer (discovered via beacon)."""
+    def __init__(self, key, from_node, conn):
+        super().__init__(id=f"in-{core._slug(key)}", classes="incoming")
+        self.border_title = f" ← {from_node} · {conn} "
+
+
+def incoming_body(inc) -> Group:
+    hdr = Text("  ")
+    hdr.append("← ", style=BLUE)
+    hdr.append(f"from {inc['from_node']}", style=f"bold {WHITE}")
+    if inc.get("last_ts"):
+        hdr.append(f"    received {core.human_age(core.time.time() - inc['last_ts'])} ago", style=MUTED)
+    else:
+        hdr.append("    nothing received yet", style=LINE)
+    l2 = Text("  ")
+    l2.append("into ", style=MUTED)
+    l2.append(inc["dir"], style=WHITE)
+    if inc.get("files") is not None:
+        l2.append(f"  ·  {inc['files']} files", style=MUTED)
+    if inc.get("size") is not None:
+        l2.append(f" · {core.humansize(inc['size'])}", style=MUTED)
+    l3 = Text("  ")
+    l3.append("source ", style=MUTED)
+    l3.append(f"{inc['from_node']}:{inc.get('source_dir', '')}", style=LINE)
+    return Group(hdr, l2, l3)
+
+
 # ── add-connection modal (dynamic, mesh) ─────────────────────────────────────
 MODES = [("Tailscale", "ts"), ("Plain SSH", "ssh"), ("Both", "both")]
 # order matches the radio buttons in AddHost (push-first is the mesh default)
@@ -820,6 +848,11 @@ class OsyncDash(App):
         border: round $secondary; border-title-color: $secondary;
         background: $boost;
     }
+    #meshdiv { height: auto; padding: 1 1 0 1; color: $foreground-muted; text-style: bold; }
+    IncomingCard {
+        height: auto; margin: 0 0 1 0; padding: 1 1; background: $panel;
+        border: round $accent; border-title-color: $accent;
+    }
     """
     BINDINGS = [
         ("r", "refresh", "Refresh"),
@@ -846,6 +879,7 @@ class OsyncDash(App):
         self.conns = []                # [(name, cfg, tgt)]
         self.data = {}                 # name -> (state, local, remote)
         self.auto = {}                 # name -> auto_status dict
+        self.incoming = []             # probed incoming-push dicts (peers → me)
         self._spin = 0
         self._load_compose()
 
@@ -864,7 +898,8 @@ class OsyncDash(App):
     def on_mount(self):
         self.register_theme(AYU)
         self.theme = "ayu"
-        self._build_cards()
+        self._build_cards()                                     # also discovers incoming
+        self._advertise()                                       # tell peers I push to them
         self.set_interval(self.interval, self.action_refresh)   # slow: probe (ssh)
         self.set_interval(1.0, self._clock_tick)                # fast: live time
         self.set_interval(0.12, self._tick)                     # spinner animation
@@ -876,10 +911,10 @@ class OsyncDash(App):
         box.remove_children()
         if not self.conns:
             box.mount(Static(
-                "No sync connections yet.\n\n"
-                "Press  a  to add one — it lands in ~/.config/osync/osync-dash.toml.",
+                "No outgoing connections on this node yet.\n\n"
+                "Press  a  to add one (a push to a peer). Incoming pushes from\n"
+                "other nodes appear below automatically.",
                 id="empty"))
-            return
         first = None
         for name, cfg, _ in self.conns:
             card = ConnectionCard(name, core.direction_of(cfg))
@@ -890,6 +925,7 @@ class OsyncDash(App):
             self.refresh_one(name, cfg, tgt)
         if first:
             first.focus()
+        self._refresh_incoming()  # re-add incoming cards after the rebuild
 
     def _card(self, name) -> ConnectionCard | None:
         try:
@@ -1014,6 +1050,39 @@ class OsyncDash(App):
     def action_refresh(self):
         for name, cfg, tgt in self.conns:
             self.refresh_one(name, cfg, tgt)
+        self._refresh_incoming()
+
+    # mesh (incoming pushes from peers) -----------------------------------
+    @work(thread=True, group="advertise", exclusive=True)
+    def _advertise(self):
+        try:
+            core.advertise_all()
+        except Exception:  # noqa: BLE001
+            pass
+
+    @work(thread=True, group="incoming", exclusive=True)
+    def _refresh_incoming(self):
+        try:
+            data = [core.probe_incoming(b) for b in core.incoming_beacons()]
+        except Exception:  # noqa: BLE001
+            data = []
+        self.call_from_thread(self._apply_incoming, data)
+
+    def _apply_incoming(self, data):
+        self.incoming = data
+        box = self.query_one("#cards", VerticalScroll)
+        for w in list(box.query(IncomingCard)) + list(box.query("#meshdiv")):
+            w.remove()
+        if not data:
+            return
+        for w in list(box.query("#empty")):  # a receive-only node isn't "empty"
+            w.remove()
+        box.mount(Static("── incoming pushes (peers → this node) ──", id="meshdiv"))
+        for inc in data:
+            card = IncomingCard(f"{inc['from_node']}-{inc['connection']}",
+                                inc["from_node"], inc["connection"])
+            box.mount(card)
+            card.update(incoming_body(inc))
 
     def action_check(self):
         name = self._focused_name()
@@ -1162,6 +1231,7 @@ class OsyncDash(App):
             self.notify(f"updated '{name}'", severity="information")
         else:
             self.notify(f"created connection '{name}'", severity="information")
+        self._advertise()  # (re)publish this node's push beacons to peers
 
     def action_delete_host(self):
         name = self._focused_name()
@@ -1175,6 +1245,10 @@ class OsyncDash(App):
     @work(thread=True, group="delete", exclusive=False)
     def _delete(self, name):
         try:
+            defaults, conns = core.parse_compose()
+            conn = next((c for c in conns if c.get("name") == name), None)
+            if conn:
+                core.unadvertise(conn, defaults)  # retract the beacon from the peer
             core.remove_connection(name)
         except Exception as e:  # noqa: BLE001
             self.call_from_thread(self.notify, f"delete failed: {e}", severity="error")
