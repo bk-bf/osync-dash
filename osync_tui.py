@@ -234,6 +234,12 @@ def card_body(name, cfg, tgt, data, spin, auto_st=None) -> Group:
     res_t.append("  ·  resume ", style=MUTED)
     res_t.append("0 clean" if resume in ("0", None) else f"{resume} retried",
                  style=MINT if resume in ("0", None) else SALMON)
+    # what the last run actually moved — parsed from osync's (pinned) log
+    lr = state.get("last_run")
+    if lr and (lr["pushed"] or lr["pulled"]):
+        res_t.append("  ·  moved ", style=MUTED)
+        res_t.append(f"↑{lr['pushed']} ↓{lr['pulled']}",
+                     style=MINT if lr.get("ok") else SALMON)
 
     dev_target = remote if tgt.get("remote") else local
     parts = [hdr, pushpull_line(cfg, tgt, state, local, remote, spin), res_t,

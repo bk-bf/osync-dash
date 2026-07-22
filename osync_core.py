@@ -44,7 +44,17 @@ import time
 import tomllib
 from pathlib import Path
 
-OSYNC_BIN = shutil.which("osync.sh") or "/usr/local/bin/osync.sh"
+def _resolve_osync() -> str:
+    """Prefer the version-pinned osync vendored by install.sh (so local matches
+    the build deployed to replicas), then fall back to PATH."""
+    home = os.environ.get("OSYNC_DASH_HOME", os.path.expanduser("~/.local/share/osync-dash"))
+    vendored = os.path.join(home, "osync", "osync.sh")
+    if os.path.exists(vendored):
+        return vendored
+    return shutil.which("osync.sh") or "/usr/local/bin/osync.sh"
+
+
+OSYNC_BIN = _resolve_osync()
 OSYNC_DIR = ".osync_workdir"
 CONFIG_HOME = Path(os.path.expanduser("~/.config/osync"))
 # single source of truth: one compose file defining many sync connections
@@ -500,6 +510,45 @@ def render(cfg, tgt, state, local, remote, width) -> str:
 
 
 # ── actions ─────────────────────────────────────────────────────────────────
+def parse_log_last_run(logfile) -> dict | None:
+    """Parse the last COMPLETED osync run from its log. The vendored osync is
+    version-pinned (versions.env), so this format is stable and safe to rely on.
+    Returns what the last sync actually moved, per direction, or None."""
+    if not logfile:
+        return None
+    p = Path(os.path.expanduser(logfile))
+    if not p.is_file():
+        return None
+    try:  # only the tail matters; logs can be large
+        with open(p, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 65536))
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    begins = [m.start() for m in re.finditer(r"- osync [\d.]+ script begin\.", text)]
+    if not begins:
+        return None
+    bounds = begins + [len(text)]
+    block = None  # newest run that actually finished (the live one may still run)
+    for i in range(len(begins) - 1, -1, -1):
+        seg = text[bounds[i]:bounds[i + 1]]
+        if "osync finished." in seg:
+            block = seg
+            break
+    if block is None:
+        return None
+
+    def grab(pat):
+        m = re.search(pat, block)
+        return int(m.group(1)) if m else 0
+    iu, tu = grab(r"Initiator has (\d+) updates"), grab(r"Target has (\d+) updates")
+    idl, tdl = grab(r"Initiator has (\d+) deletions"), grab(r"Target has (\d+) deletions")
+    return {"pushed": tu + tdl, "pulled": iu + idl, "push_del": tdl, "pull_del": idl,
+            "total": iu + tu + idl + tdl,
+            "ok": re.search(r"\b(CRITICAL|ERROR)\b", block) is None}
+
+
 def compute_pending(cfg_path: Path) -> dict | None:
     """Authoritative osync dry-run: exact updates + deletions in each direction.
     Slower than the live probe counts (a full rsync comparison over ssh), so it's
@@ -1369,6 +1418,7 @@ def gather(cfg, tgt, local_only=False):
             remote = last or remote
 
     state = probe_state(cfg, sync_dir)
+    state["last_run"] = parse_log_last_run(cfg.get("LOGFILE"))
     ts = tailscale_map()
     if ts:
         local["ts"] = ts.get((local.get("host") or "").lower())

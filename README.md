@@ -10,8 +10,8 @@ gets its own always-expanded card: merged health + sync-state, both machines
 ```
 ┌ ubuntuserver  ⇄ ──────────────────────────────────────────────────────────┐
 │ ● HEALTHY   last sync 3m ago                                               │
-│ ↑ push idle          ↓ pull idle                                          │
-│ result synced · remote synced · resume 0 clean                            │
+│ ↑ push in sync       ↓ pull in sync                                       │
+│ result synced · remote synced · resume 0 clean · moved ↑2 ↓0              │
 │                                                                            │
 │ ▎ local   my-laptop    ● online   rsync ✓   ↳ my-laptop · 100.x.y.z       │
 │     350 files · 235M    disk ███████──────── 41%  300G free               │
@@ -38,11 +38,13 @@ to the focused one.
 ## Architecture
 
 - **`osync_core.py`** — data layer + one-shot renderer. **Standard library only**,
-  runs on the system Python. Powers `--print` and all the probing.
+  runs on the system Python. Powers `--print`, all the probing, and the log parsing.
 - **`osync_tui.py`** — the interactive [Textual](https://textual.textualize.io)
   app. The one third-party dependency, kept in a project virtualenv.
 - **`osync-dash`** — thin launcher: interactive → Textual (venv); otherwise →
   the stdlib one-shot renderer.
+- **`versions.env`** — pinned dependency versions (osync ref + Textual), read by
+  `install.sh`. The single place to bump versions.
 
 So the TUI is a proper app (mouse, resize, background refresh, key bindings),
 while `--print` stays dependency-free for scripts, cron, and non-TTY pipes.
@@ -50,21 +52,45 @@ while `--print` stays dependency-free for scripts, cron, and non-TTY pipes.
 ## Requirements
 
 - Python 3.11+ (uses stdlib `tomllib`)
-- `osync` (`osync.sh` on `PATH` or `/usr/local/bin/osync.sh`)
-- `rsync` + `ssh` on both ends (already required by osync)
-- The TUI needs `textual` — `install.sh` puts it in a local `.venv`
-- Optional: `tailscale` (device names + import dropdown)
+- `git`, `rsync`, `ssh` (git only for install; rsync/ssh are osync's own deps)
+- Optional: `tailscale` (device names + import dropdown), `inotify-tools` (for
+  on-change auto-sync)
+
+You do **not** need to install osync yourself — the installer vendors a pinned
+build (see below).
 
 ## Install
 
+One line, no clone needed:
+
 ```sh
-git clone https://github.com/bk-bf/osync-dash.git
-cd osync-dash
-./install.sh            # creates .venv, installs Textual, symlinks to ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/bk-bf/osync-dash/main/install.sh | bash
 ```
 
-`./install.sh [BINDIR]` to link somewhere else. The `--print` path works even
-without the venv (system Python, stdlib only).
+The installer:
+
+1. fetches osync-dash into `~/.local/share/osync-dash/`,
+2. **vendors the pinned osync** (`versions.env`) into `…/osync/osync.sh`,
+3. creates the Textual `.venv` with the pinned Textual,
+4. symlinks `osync-dash` into `~/.local/bin`.
+
+Re-run any time — it's idempotent. `install.sh [BINDIR]` links elsewhere. From a
+clone, `./install.sh` works the same. `--print` still runs on the system Python
+(stdlib only) even without the venv.
+
+### Version pinning & replicas
+
+Everything osync-dash runs uses the osync build pinned in `versions.env`, so
+behaviour — and osync's **log format**, which the dashboard parses — is identical
+on every machine. To put that same byte-identical osync on a replica (osync.sh
+is a single self-contained script):
+
+```sh
+~/.local/share/osync-dash/src/install.sh --remote user@host
+```
+
+Bump a version by editing `versions.env` and re-running `install.sh` (and
+`--remote` for each replica).
 
 ## Usage
 
@@ -210,7 +236,9 @@ osync-dash --local-only     # offline: skip the remote probe
 | files/size | live walk locally; one combined `ssh` probe remotely |
 | free space | `statvfs` locally, `df` remotely |
 | safety net | file counts under `.osync_workdir/{deleted,backup}` on both sides |
-| pending  | `osync … --dry --summary`, parsed for update/deletion counts |
+| ↑push/↓pull (live) | files changed since the last sync — local mtime walk + remote `find -newermt` |
+| moved (last run) | osync's own log, parsed for the last completed run's updates/deletions per direction (reliable thanks to the pinned osync) |
+| pending (exact) | `osync … --dry --summary` on demand (`c`), for exact updates + deletions |
 
 ## License
 
