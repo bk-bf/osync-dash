@@ -65,7 +65,8 @@ In the TUI:
 | `r` | refresh now |
 | `c` | run the pending-changes dry-run |
 | `s` | run the sync (suspends to stream osync, then returns) |
-| `t` | toggle the remote between its Tailscale and plain-SSH endpoint |
+| `t` | cycle the endpoint mode (Tailscale / SSH / both) |
+| `d` | cycle the sync direction (bidirectional / send → / receive ←) |
 | `n` | open the host switcher (floating popup; dashboard stays visible behind) |
 | `a` | add a new host (floating form, writes a new config) |
 | `l` | page the osync log |
@@ -75,14 +76,26 @@ Status refreshes on a background thread, so ssh probes never freeze the UI.
 Resize and mouse work; it's fine over SSH. The theme follows btop's **ayu**
 palette, with gradient disk meters per machine.
 
-## Multiple hosts · Tailscale ⇄ plain SSH
+## Mesh: add hosts, browse dirs, pick a direction
 
-Each osync job in `~/.config/osync/*.conf` is a "host"; cycle them with `n`.
-Press `a` to add one via a form — name, local dir, remote user/path, an ssh
-key, and **both** a Tailscale host and a plain-SSH host. osync-dash stores both
-endpoints in the config (`DASH_*` keys osync ignores) and `t` flips
-`TARGET_SYNC_DIR` between them live — Tailscale when you're roaming, LAN/direct
-SSH when you're on the same network.
+Press `a` for a setup form that turns osync-dash into a little sync-mesh
+controller:
+
+- **Import a device** — a dropdown of your Tailscale peers (online/OS shown), or
+  "manual entry". Picking one fills in its host.
+- **Endpoint mode** — Tailscale / Plain SSH / **Both**. The form is dynamic: it
+  only asks for the hosts the chosen mode needs. In **both** mode osync-dash
+  prefers Tailscale and **falls back to plain SSH** automatically when Tailscale
+  is unreachable (it repoints `TARGET_SYNC_DIR` to whichever answers).
+- **Directory autocomplete** — type in the remote-dir field and it lists real
+  subdirectories on that device over ssh (cached, drill in by selecting); the
+  local-dir field does the same against your filesystem. No exact typing.
+- **Direction** — Bidirectional ⇄, Send → (local→remote), or Receive ←
+  (remote→local), mapped to osync's native `SYNC_TYPE`.
+
+Each job in `~/.config/osync/*.conf` is a host; cycle them from the `n` popup.
+On the dashboard, `t` cycles the endpoint mode and `d` the direction live. All
+osync-dash bookkeeping lives in `DASH_*` keys that osync ignores.
 
 ### Non-interactive
 

@@ -536,15 +536,15 @@ PATH_SEPARATOR_CHAR=";"
 INITIATOR_CUSTOM_STATE_DIR=""
 TARGET_CUSTOM_STATE_DIR=""
 
-## osync-dash: dual endpoint bookkeeping (ignored by osync). Toggle rewrites
-## TARGET_SYNC_DIR between the Tailscale and the plain-SSH host.
+## osync-dash: endpoint bookkeeping (ignored by osync). Mode ts|ssh|both;
+## in 'both', osync-dash prefers Tailscale and falls back to SSH.
 DASH_TARGET_USER="{user}"
 DASH_TARGET_PATH="{path}"
 DASH_TS_HOST="{ts_host}"
 DASH_TS_PORT="{ts_port}"
 DASH_SSH_HOST="{ssh_host}"
 DASH_SSH_PORT="{ssh_port}"
-DASH_ACTIVE="{active}"
+DASH_ENDPOINT_MODE="{mode}"
 
 [REMOTE_OPTIONS]
 SSH_COMPRESSION=false
@@ -584,7 +584,7 @@ CONFLICT_PREVALANCE=initiator
 SOFT_DELETE=true
 SOFT_DELETE_DAYS=30
 SKIP_DELETION=
-SYNC_TYPE=
+SYNC_TYPE={sync_type}
 
 [RESUME_OPTIONS]
 RESUME_SYNC=true
@@ -616,17 +616,29 @@ RUN_AFTER_CMD_ON_ERROR=false
 """
 
 
+DIRECTION_SYNC = {"send": "initiator2target", "receive": "target2initiator", "bidir": ""}
+SYNC_DIRECTION = {v: k for k, v in DIRECTION_SYNC.items()}
+
+
+def direction_of(cfg: dict) -> str:
+    return SYNC_DIRECTION.get(cfg.get("SYNC_TYPE", "").strip(), "bidir")
+
+
+def mode_of(cfg: dict) -> str:
+    return cfg.get("DASH_ENDPOINT_MODE", "") or ""
+
+
 def create_config(*, instance, initiator_dir, user, path, key="~/.ssh/id_ed25519",
-                   ts_host="", ts_port="22", ssh_host="", ssh_port="22",
-                   active="ts") -> Path:
+                  ts_host="", ts_port="22", ssh_host="", ssh_port="22",
+                  mode="ts", direction="bidir") -> Path:
     """Write a new osync .conf for a host. Returns the path. Raises on collision."""
     CONFIG_HOME.mkdir(parents=True, exist_ok=True)
     inst = _slug(instance)
     cfg_path = CONFIG_HOME / f"{inst}.conf"
     if cfg_path.exists():
         raise FileExistsError(f"{cfg_path} already exists")
-    host = ts_host if active == "ts" else ssh_host
-    port = ts_port if active == "ts" else ssh_port
+    # primary host: TS unless mode is ssh-only
+    host, port = (ssh_host, ssh_port) if mode == "ssh" else (ts_host, ts_port)
     initiator = os.path.expanduser(initiator_dir)
     text = CONFIG_TEMPLATE.format(
         instance=inst, initiator=initiator,
@@ -635,74 +647,160 @@ def create_config(*, instance, initiator_dir, user, path, key="~/.ssh/id_ed25519
         key=os.path.expanduser(key) if key else "",
         logfile=os.path.expanduser(f"~/.cache/osync/{inst}.log"),
         user=user, path=path, ts_host=ts_host, ts_port=ts_port or "22",
-        ssh_host=ssh_host, ssh_port=ssh_port or "22", active=active)
+        ssh_host=ssh_host, ssh_port=ssh_port or "22", mode=mode,
+        sync_type=DIRECTION_SYNC.get(direction, ""))
     cfg_path.write_text(text)
     Path(os.path.expanduser("~/.cache/osync")).mkdir(parents=True, exist_ok=True)
     return cfg_path
 
 
 def _rewrite_conf(path: Path, updates: dict):
-    """Replace `KEY="val"` lines in-place (values quoted); keys must already exist."""
+    """Replace/append `KEY="val"` lines in-place (values quoted)."""
     lines = path.read_text().splitlines()
     done = set()
     for i, line in enumerate(lines):
         m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=", line)
         if m and m.group(1) in updates:
-            k = m.group(1)
-            lines[i] = f'{k}="{updates[k]}"'
-            done.add(k)
+            lines[i] = f'{m.group(1)}="{updates[m.group(1)]}"'
+            done.add(m.group(1))
+    for k, v in updates.items():
+        if k not in done:
+            lines.append(f'{k}="{v}"')
     path.write_text("\n".join(lines) + "\n")
     return done
 
 
-def endpoint_of(cfg: dict) -> str:
-    """'ts' | 'ssh' | '' — which endpoint the config is currently pointed at."""
-    return cfg.get("DASH_ACTIVE", "")
+def endpoints(cfg: dict) -> list[tuple[str, str, str]]:
+    """Ordered (which, host, port) to try, from DASH_ENDPOINT_MODE. 'both' → TS
+    first then SSH. Legacy configs with no mode fall back to their TARGET host."""
+    mode = mode_of(cfg)
+    ts = ("ts", cfg.get("DASH_TS_HOST", ""), cfg.get("DASH_TS_PORT", "22"))
+    ssh = ("ssh", cfg.get("DASH_SSH_HOST", ""), cfg.get("DASH_SSH_PORT", "22"))
+    order = {"ts": [ts], "ssh": [ssh], "both": [ts, ssh]}.get(mode)
+    if not order:
+        t = parse_target(cfg.get("TARGET_SYNC_DIR", ""))
+        return [("current", t.get("host", ""), t.get("port", "22"))]
+    return [(w, h, p) for (w, h, p) in order if h]
 
 
-def has_dual_endpoints(cfg: dict) -> bool:
-    return bool(cfg.get("DASH_TS_HOST") and cfg.get("DASH_SSH_HOST"))
+def available_modes(cfg: dict) -> list[str]:
+    has_ts, has_ssh = bool(cfg.get("DASH_TS_HOST")), bool(cfg.get("DASH_SSH_HOST"))
+    m = []
+    if has_ts:
+        m.append("ts")
+    if has_ssh:
+        m.append("ssh")
+    if has_ts and has_ssh:
+        m.append("both")
+    return m
 
 
-def toggle_endpoint(cfg_path: Path) -> tuple[str, str]:
-    """Flip a config between its Tailscale and plain-SSH endpoint.
-
-    Returns (new_active, message). Requires DASH_* metadata (configs created by
-    osync-dash have it); returns ('', reason) if it can't toggle.
-    """
+def cycle_mode(cfg_path: Path) -> tuple[str, str]:
+    """Cycle DASH_ENDPOINT_MODE through the configured endpoints; point
+    TARGET_SYNC_DIR at the new mode's primary host. Returns (mode, message)."""
     cfg = parse_config(cfg_path)
-    if not has_dual_endpoints(cfg):
-        return "", "no alternate endpoint (add SSH + Tailscale hosts in setup)"
-    cur = cfg.get("DASH_ACTIVE", "ts")
-    new = "ssh" if cur == "ts" else "ts"
-    user = cfg.get("DASH_TARGET_USER") or (parse_target(cfg.get("TARGET_SYNC_DIR", "")).get("user") or "")
-    path = cfg.get("DASH_TARGET_PATH") or (parse_target(cfg.get("TARGET_SYNC_DIR", "")).get("path") or "")
-    host = cfg["DASH_TS_HOST"] if new == "ts" else cfg["DASH_SSH_HOST"]
-    port = cfg.get("DASH_TS_PORT", "22") if new == "ts" else cfg.get("DASH_SSH_PORT", "22")
-    _rewrite_conf(cfg_path, {
-        "TARGET_SYNC_DIR": target_uri(user, host, port, path),
-        "DASH_ACTIVE": new,
-    })
-    label = "Tailscale" if new == "ts" else "plain SSH"
-    return new, f"switched to {label}: {user}@{host}"
+    modes = available_modes(cfg)
+    if len(modes) < 2:
+        return "", "only one endpoint configured (add another in setup)"
+    cur = mode_of(cfg)
+    new = modes[(modes.index(cur) + 1) % len(modes)] if cur in modes else modes[0]
+    user = cfg.get("DASH_TARGET_USER", "") or parse_target(cfg.get("TARGET_SYNC_DIR", "")).get("user", "")
+    path = cfg.get("DASH_TARGET_PATH", "") or parse_target(cfg.get("TARGET_SYNC_DIR", "")).get("path", "")
+    which, host, port = endpoints({**cfg, "DASH_ENDPOINT_MODE": new})[0]
+    _rewrite_conf(cfg_path, {"DASH_ENDPOINT_MODE": new,
+                             "TARGET_SYNC_DIR": target_uri(user, host, port, path)})
+    label = {"ts": "Tailscale", "ssh": "plain SSH", "both": "both (TS→SSH fallback)"}[new]
+    return new, f"endpoint: {label}"
+
+
+def set_direction(cfg_path: Path, direction: str) -> str:
+    _rewrite_conf(cfg_path, {"SYNC_TYPE": DIRECTION_SYNC.get(direction, "")})
+    return direction
+
+
+# ── directory listing (for the add-host autocomplete) ────────────────────────
+def list_local_dirs(base: str) -> list[str]:
+    b = Path(os.path.expanduser(base or "~"))
+    if not b.is_dir():
+        b = b.parent if b.parent.is_dir() else Path.home()
+    try:
+        return sorted((e.name for e in os.scandir(b) if e.is_dir()), key=str.lower)
+    except OSError:
+        return []
+
+
+def list_remote_dirs(user, host, port, key, base) -> list[str]:
+    """List subdirectory names of `base` on the remote (for autocomplete)."""
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "-o", "ControlPath=none", "-p", str(port or "22")]
+    if key and os.path.exists(os.path.expanduser(key)):
+        cmd += ["-i", os.path.expanduser(key)]
+    b = base or "~"
+    # ls -1Ap: one per line, dirs get trailing /. keep only dirs.
+    remote_cmd = f'ls -1Ap {b} 2>/dev/null | grep "/$"'
+    rc, out = run(cmd + [f"{user}@{host}", remote_cmd], timeout=12)
+    if rc != 0:
+        return []
+    return [ln[:-1] for ln in out.splitlines() if ln.endswith("/")]
+
+
+def ts_devices() -> list[dict]:
+    """Tailscale peers as {name, dns, ip, os, online}, online + linux first."""
+    m = tailscale_map()
+    if not shutil.which("tailscale"):
+        return []
+    rc, out = run(["tailscale", "status", "--json"], timeout=6)
+    if rc != 0 or "{" not in out:
+        return []
+    try:
+        data, _ = json.JSONDecoder().raw_decode(out[out.index("{"):])
+    except (json.JSONDecodeError, ValueError):
+        return []
+    devs = []
+    for n in (data.get("Peer") or {}).values():
+        dns = (n.get("DNSName") or "").rstrip(".")
+        ip4 = next((ip for ip in (n.get("TailscaleIPs") or []) if ":" not in ip), "")
+        devs.append({"name": dns.split(".")[0] if dns else n.get("HostName", ""),
+                     "dns": dns, "ip": ip4, "os": n.get("OS", ""),
+                     "online": bool(n.get("Online"))})
+    devs.sort(key=lambda d: (not d["online"], d["os"] != "linux", d["name"].lower()))
+    return devs
 
 
 def gather(cfg, tgt, local_only=False):
     sync_dir = Path(os.path.expanduser(cfg.get("INITIATOR_SYNC_DIR", "")))
     local = probe_local(sync_dir)
-    remote = probe_remote(cfg, tgt) if (tgt.get("remote") and not local_only) else {"reach": False, "err": "skipped"}
-    state = probe_state(cfg, sync_dir)
+    remote = {"reach": False, "err": "skipped"}
+    if tgt.get("remote") and not local_only:
+        user = tgt.get("user", "")
+        path = tgt.get("path", "")
+        last = None
+        for which, host, port in endpoints(cfg):
+            r = probe_remote(cfg, {**tgt, "host": host, "port": port})
+            last = r
+            if r.get("reach"):
+                r["endpoint_used"] = which
+                # keep the config pointed at the reachable endpoint for osync runs
+                if host != tgt.get("host") and cfg.get("_configfile"):
+                    _rewrite_conf(Path(cfg["_configfile"]),
+                                  {"TARGET_SYNC_DIR": target_uri(user, host, port, path)})
+                    cfg["TARGET_SYNC_DIR"] = target_uri(user, host, port, path)
+                    tgt["host"], tgt["port"] = host, port
+                remote = r
+                break
+        else:
+            remote = last or remote
 
+    state = probe_state(cfg, sync_dir)
     ts = tailscale_map()
     if ts:
         local["ts"] = ts.get((local.get("host") or "").lower())
         if tgt.get("remote"):
             ident = ts.get((remote.get("host") or "").lower())
-            if not ident:  # ssh probe may have failed; match via the alias's IP
+            if not ident:
                 ip = resolve_ssh_host(tgt.get("host", ""))
                 ident = ts.get(ip) if ip else None
             remote["ts"] = ident
-            if not remote.get("host") and ident:  # surface a name even when offline
+            if not remote.get("host") and ident:
                 remote["host"] = ident.get("name")
     return state, local, remote
 

@@ -23,7 +23,7 @@ from textual.containers import Grid, Horizontal, Vertical, VerticalScroll  # noq
 from textual.screen import ModalScreen  # noqa: E402
 from textual.theme import Theme  # noqa: E402
 from textual.widgets import (Button, Footer, Header, Input, Label, OptionList,  # noqa: E402
-                             RadioButton, RadioSet, Static)
+                             RadioButton, RadioSet, Select, Static)
 from textual.widgets.option_list import Option  # noqa: E402
 
 # ── ayu palette (from btop's ayu.theme) ──────────────────────────────────────
@@ -171,18 +171,30 @@ def state_render(cfg, state) -> Table:
     ])
 
 
-def paths_render(cfg, tgt) -> Table:
-    active = core.endpoint_of(core.parse_config(Path(cfg["_configfile"]))) if cfg.get("_configfile") else ""
+MODE_LABEL = {"ts": ("Tailscale", MINT), "ssh": ("plain SSH", GOLD),
+              "both": ("both · TS→SSH", BLUE), "": ("", MUTED)}
+DIR_LABEL = {"send": ("→ send to remote", GOLD), "receive": ("← receive from remote", BLUE),
+             "bidir": ("⇄ bidirectional", MINT)}
+
+
+def paths_render(cfg, tgt, remote=None) -> Table:
     tgt_s = (f"{tgt.get('user','')}@{tgt.get('host','')}:{tgt.get('path','?')}"
              if tgt.get("remote") else cfg.get("TARGET_SYNC_DIR", "?"))
-    tgt_t = Text(tgt_s, style=WHITE)
-    if active:
-        tgt_t.append(f"   via {'Tailscale' if active=='ts' else 'plain SSH'}",
-                     style=MINT if active == "ts" else GOLD)
+    mode = core.mode_of(cfg)
+    mlabel, mcol = MODE_LABEL.get(mode, ("", MUTED))
+    conn = Text()
+    if mlabel:
+        conn.append(mlabel, style=mcol)
+    used = (remote or {}).get("endpoint_used")
+    if used and mode == "both":
+        conn.append(f"  · live: {'TS' if used=='ts' else 'SSH'}",
+                    style=MINT if used == "ts" else GOLD)
+    dlabel, dcol = DIR_LABEL.get(core.direction_of(cfg), ("", MUTED))
     return _kv([
         ("local", Text(cfg.get("INITIATOR_SYNC_DIR", "?"), style=WHITE)),
-        ("remote", tgt_t),
-        ("workdir", Text(f"{cfg.get('INITIATOR_SYNC_DIR','')}/{core.OSYNC_DIR}", style=MUTED)),
+        ("remote", Text(tgt_s, style=WHITE)),
+        ("direction", Text(dlabel, style=dcol)),
+        ("connection", conn if mlabel else Text("—", style=MUTED)),
         ("log", Text(cfg.get("LOGFILE", "—") or "—", style=MUTED)),
         ("config", Text(cfg.get("_configfile", ""), style=MUTED)),
     ])
@@ -243,6 +255,110 @@ class Panel(Static):
         self.styles.border_title_color = color
 
 
+# ── directory autocomplete field ─────────────────────────────────────────────
+class DirField(Vertical):
+    """Input + live dropdown of matching subdirectories (local or remote).
+
+    `resolver` None → completes local paths. Otherwise a callable returning
+    (user, host, port, key) — or None when the connection isn't set yet — and
+    the field lists remote dirs over ssh (cached per connection+parent)."""
+
+    def __init__(self, fid, placeholder="", value="~/", resolver=None):
+        super().__init__(id=fid, classes="dirfield")
+        self._placeholder = placeholder
+        self._initial = value
+        self.resolver = resolver
+        self.cache = {}
+
+    def compose(self) -> ComposeResult:
+        yield Input(value=self._initial, placeholder=self._placeholder, id="in")
+        ol = OptionList(id="opts")
+        ol.display = False
+        yield ol
+
+    @property
+    def value(self) -> str:
+        return self.query_one("#in", Input).value
+
+    def set_value(self, v):
+        self.query_one("#in", Input).value = v
+
+    def _split(self, v):
+        v = v or ""
+        if v in ("", "~", "~/"):
+            return ("~/", "")
+        if v.endswith("/"):
+            return (v, "")
+        if "/" not in v:
+            return ("~/", v)
+        i = v.rfind("/")
+        return (v[:i + 1], v[i + 1:])
+
+    def _dirs(self, parent):
+        if self.resolver is None:
+            return core.list_local_dirs(parent), "ok"
+        conn = self.resolver()
+        if not conn:
+            return [], "noconn"
+        key = (conn, parent)
+        if key in self.cache:
+            return self.cache[key], "ok"
+        self._fetch(conn, parent, key)
+        return [], "fetching"
+
+    @work(thread=True, exclusive=True, group="dirfetch")
+    def _fetch(self, conn, parent, key):
+        dirs = core.list_remote_dirs(*conn, parent)
+        self.cache[key] = dirs
+        self.app.call_from_thread(self._refresh)
+
+    def _refresh(self):
+        parent, prefix = self._split(self.value)
+        dirs, status = self._dirs(parent)
+        ol = self.query_one("#opts", OptionList)
+        ol.clear_options()
+        if status == "noconn":
+            ol.add_option(Option(Text("set the remote user + host first", style=MUTED), id="__x__"))
+            ol.display = True
+            return
+        if status == "fetching":
+            ol.add_option(Option(Text("listing…", style=MUTED), id="__x__"))
+            ol.display = True
+            return
+        pl = prefix.lower()
+        matches = sorted((d for d in dirs if pl in d.lower()),
+                         key=lambda d: (not d.lower().startswith(pl), d.lower()))
+        if not matches:
+            ol.display = False
+            return
+        for d in matches[:8]:
+            ol.add_option(Option(Text(d + "/", style=WHITE), id=d))
+        ol.display = True
+
+    def on_mount(self):
+        self._refresh()
+
+    @on(Input.Changed, "#in")
+    def _changed(self, e):
+        e.stop()
+        self._refresh()
+
+    @on(OptionList.OptionSelected, "#opts")
+    def _selected(self, e):
+        e.stop()
+        if e.option.id == "__x__":
+            return
+        parent, _ = self._split(self.value)
+        self.set_value(parent + e.option.id + "/")
+        self.query_one("#in", Input).focus()
+        self._refresh()
+
+    def on_key(self, e):
+        if e.key == "down" and self.query_one("#opts", OptionList).display:
+            self.query_one("#opts", OptionList).focus()
+            e.stop()
+
+
 # ── host-switch popup ────────────────────────────────────────────────────────
 class HostPicker(ModalScreen):
     """A floating list of hosts; the dashboard stays visible (dimmed) behind."""
@@ -269,7 +385,7 @@ class HostPicker(ModalScreen):
             for p in self.configs:
                 c = core.parse_config(p)
                 name = c.get("INSTANCE_ID", p.stem)
-                via = {"ts": "tailscale", "ssh": "ssh"}.get(c.get("DASH_ACTIVE", ""), "")
+                via = {"ts": "tailscale", "ssh": "ssh", "both": "ts→ssh"}.get(c.get("DASH_ENDPOINT_MODE", ""), "")
                 t = Text("● " if p == self.current else "  ",
                          style=MINT if p == self.current else MUTED)
                 t.append(name, style=f"bold {WHITE}" if p == self.current else FG)
@@ -299,57 +415,124 @@ class HostPicker(ModalScreen):
         self.dismiss("__add__")
 
 
-# ── add-host modal ───────────────────────────────────────────────────────────
+# ── add-host modal (dynamic, mesh) ───────────────────────────────────────────
+MODES = [("Tailscale", "ts"), ("Plain SSH", "ssh"), ("Both", "both")]
+DIRS = [("bidir", "bidir"), ("send", "send"), ("receive", "receive")]
+
+
 class AddHost(ModalScreen):
     CSS = """
     AddHost { align: center middle; background: $background 55%; }
-    #box { width: 74; height: auto; padding: 1 2; background: $panel;
+    #box { width: 82; height: auto; max-height: 90%; padding: 1 2; background: $panel;
            border: round $primary; }
-    #box .h { color: $primary; text-style: bold; margin-bottom: 1; }
+    #box .h { color: $primary; text-style: bold; }
+    #box .sub { color: $foreground-muted; margin-bottom: 1; }
+    #form { height: auto; max-height: 26; overflow-y: auto; scrollbar-size-vertical: 1; }
     #box Label { color: $foreground-muted; margin-top: 1; }
     #box Input { border: tall $panel-lighten-2; }
-    #box RadioSet { border: none; height: auto; layout: horizontal; margin-top: 1; }
+    #box RadioSet { border: none; height: auto; layout: horizontal; }
+    .dirfield { height: auto; }
+    .dirfield OptionList { border: round $panel-lighten-2; background: $boost;
+                          height: auto; max-height: 7; }
+    #ssh_row, #ts_row { height: auto; }
     #err { color: $error; height: auto; }
     #btns { height: auto; align-horizontal: right; margin-top: 1; }
     #btns Button { margin-left: 2; }
+    .cols { height: auto; }
+    .cols Input { width: 1fr; }
     """
     BINDINGS = [("escape", "cancel", "Cancel")]
 
-    def __init__(self, ts_devices):
+    def __init__(self, devices):
         super().__init__()
-        self.ts_devices = ts_devices
+        self.devices = devices
+
+    def _mode(self):
+        return MODES[self.query_one("#i_mode", RadioSet).pressed_index or 0][1]
+
+    def _conn(self):
+        """Current (user, host, port, key) for remote-dir listing, or None."""
+        user = self.query_one("#i_user", Input).value.strip()
+        mode = self._mode()
+        host = (self.query_one("#i_ts", Input).value.strip() if mode != "ssh"
+                else self.query_one("#i_ssh", Input).value.strip())
+        port = (self.query_one("#i_tsport", Input).value.strip() if mode != "ssh"
+                else self.query_one("#i_sshport", Input).value.strip()) or "22"
+        key = self.query_one("#i_key", Input).value.strip()
+        return (user, host, port, key) if (user and host) else None
 
     def compose(self) -> ComposeResult:
+        opts = [(f"{d['name']}  ·  {d['os']}{'  ●' if d['online'] else '  ○'}", d["dns"] or d["name"])
+                for d in self.devices]
+        opts.append(("✎  manual entry", "__manual__"))
         with Vertical(id="box"):
             yield Static("＋ add a sync host", classes="h")
-            yield Label("name (used for the config filename)")
-            yield Input(placeholder="e.g. desktop, nas, vps", id="i_name")
-            yield Label("local directory (this machine)")
-            yield Input(value=os.path.expanduser("~/"), id="i_init")
-            yield Label("remote user  ·  remote path")
-            with Horizontal():
-                yield Input(placeholder="ubuntu", id="i_user")
-                yield Input(placeholder="/home/ubuntu/sync", id="i_path")
-            hint = ("Tailscale host: MagicDNS name, tailnet IP, or an ssh alias.  "
-                    + ("seen: " + ", ".join(self.ts_devices[:4]) if self.ts_devices else ""))
-            yield Label(hint)
-            with Horizontal():
-                yield Input(placeholder="ubuntu / host.tailXXXX.ts.net", id="i_ts")
-                yield Input(value="22", id="i_tsport")
-            yield Label("plain-SSH host (LAN/public)  ·  port")
-            with Horizontal():
-                yield Input(placeholder="192.168.1.50 / host.example.com", id="i_ssh")
-                yield Input(value="22", id="i_sshport")
-            yield Label("ssh identity key")
-            yield Input(value=os.path.expanduser("~/.ssh/id_ed25519"), id="i_key")
-            yield Label("reach it via")
-            with RadioSet(id="i_active"):
-                yield RadioButton("Tailscale", value=True, id="rb_ts")
-                yield RadioButton("Plain SSH", id="rb_ssh")
+            yield Static("import a Tailscale device (or enter a host), then pick dirs to sync", classes="sub")
+            with VerticalScroll(id="form"):
+                yield Label("device")
+                yield Select(opts, prompt="pick a Tailscale device…", id="i_device", allow_blank=True)
+
+                yield Label("reach it via")
+                with RadioSet(id="i_mode"):
+                    yield RadioButton("Tailscale", value=True)
+                    yield RadioButton("Plain SSH")
+                    yield RadioButton("Both  (TS→SSH)")
+
+                with Vertical(id="ts_row"):
+                    yield Label("Tailscale host  ·  port")
+                    with Horizontal(classes="cols"):
+                        yield Input(placeholder="host.tailXXXX.ts.net / alias", id="i_ts")
+                        yield Input(value="22", id="i_tsport")
+                with Vertical(id="ssh_row"):
+                    yield Label("plain-SSH host  ·  port")
+                    with Horizontal(classes="cols"):
+                        yield Input(placeholder="192.168.1.50 / host.example.com", id="i_ssh")
+                        yield Input(value="22", id="i_sshport")
+
+                yield Label("remote user  ·  ssh key")
+                with Horizontal(classes="cols"):
+                    yield Input(placeholder="ubuntu", id="i_user")
+                    yield Input(value=os.path.expanduser("~/.ssh/id_ed25519"), id="i_key")
+
+                yield Label("remote directory (type to autocomplete on that device)")
+                yield DirField("i_rpath", placeholder="~/sync", resolver=self._conn)
+
+                yield Label("local directory (this machine)")
+                yield DirField("i_lpath", placeholder="~/sync")
+
+                yield Label("direction")
+                with RadioSet(id="i_dir"):
+                    yield RadioButton("⇄ Bidirectional", value=True)
+                    yield RadioButton("→ Send")
+                    yield RadioButton("← Receive")
+
+                yield Label("name")
+                yield Input(placeholder="desktop / nas / vps", id="i_name")
+
             yield Static("", id="err")
             with Horizontal(id="btns"):
                 yield Button("Cancel", id="cancel")
                 yield Button("Create", variant="primary", id="create")
+
+    def on_mount(self):
+        self._sync_mode_rows()
+
+    def _sync_mode_rows(self):
+        mode = self._mode()
+        self.query_one("#ts_row").display = mode in ("ts", "both")
+        self.query_one("#ssh_row").display = mode in ("ssh", "both")
+
+    @on(RadioSet.Changed, "#i_mode")
+    def _mode_changed(self, e):
+        self._sync_mode_rows()
+
+    @on(Select.Changed, "#i_device")
+    def _device_changed(self, e):
+        if e.value in (Select.BLANK, "__manual__", None):
+            return
+        self.query_one("#i_ts", Input).value = str(e.value)
+        if not self.query_one("#i_name", Input).value.strip():
+            self.query_one("#i_name", Input).value = str(e.value).split(".")[0]
 
     def action_cancel(self):
         self.dismiss(None)
@@ -360,23 +543,29 @@ class AddHost(ModalScreen):
 
     @on(Button.Pressed, "#create")
     def _create(self):
-        g = lambda i: self.query_one(f"#{i}", Input).value.strip()
-        name, init, user, path = g("i_name"), g("i_init"), g("i_user"), g("i_path")
+        g = lambda i: self.query_one(f"#{i}", Input).value.strip()  # noqa: E731
+        mode = self._mode()
+        direction = DIRS[self.query_one("#i_dir", RadioSet).pressed_index or 0][1]
+        name, user = g("i_name"), g("i_user")
+        rpath = self.query_one("#i_rpath", DirField).value.strip()
+        lpath = self.query_one("#i_lpath", DirField).value.strip()
         ts_host, ssh_host = g("i_ts"), g("i_ssh")
-        active = "ts" if self.query_one("#i_active", RadioSet).pressed_index == 0 else "ssh"
         err = self.query_one("#err", Static)
-        missing = [n for n, v in (("name", name), ("local dir", init), ("user", user), ("path", path)) if not v]
-        if missing:
-            err.update(f"missing: {', '.join(missing)}"); return
-        if active == "ts" and not ts_host:
-            err.update("Tailscale selected but no Tailscale host given"); return
-        if active == "ssh" and not ssh_host:
-            err.update("Plain SSH selected but no SSH host given"); return
+        need = [n for n, v in (("name", name), ("user", user),
+                               ("remote dir", rpath), ("local dir", lpath)) if not v]
+        if mode in ("ts", "both") and not ts_host:
+            need.append("Tailscale host")
+        if mode in ("ssh", "both") and not ssh_host:
+            need.append("SSH host")
+        if need:
+            err.update("missing: " + ", ".join(need))
+            return
         try:
             p = core.create_config(
-                instance=name, initiator_dir=init, user=user, path=path, key=g("i_key"),
+                instance=name, initiator_dir=lpath, user=user, path=rpath, key=g("i_key"),
                 ts_host=ts_host, ts_port=g("i_tsport") or "22",
-                ssh_host=ssh_host, ssh_port=g("i_sshport") or "22", active=active)
+                ssh_host=ssh_host, ssh_port=g("i_sshport") or "22",
+                mode=mode, direction=direction)
         except FileExistsError as e:
             err.update(str(e)); return
         except Exception as e:  # noqa: BLE001
@@ -400,7 +589,8 @@ class OsyncDash(App):
         ("r", "refresh", "Refresh"),
         ("c", "check", "Check"),
         ("s", "sync", "Sync"),
-        ("t", "toggle_endpoint", "TS/SSH"),
+        ("t", "cycle_mode", "Endpoint"),
+        ("d", "cycle_direction", "Direction"),
         ("n", "next_host", "Host"),
         ("a", "add_host", "Add"),
         ("l", "log", "Log"),
@@ -424,9 +614,10 @@ class OsyncDash(App):
     def _load_cfg(self):
         self.cfg, self.tgt = core.load(self.cfg_path)
         self.title = "osync-dash"
-        active = self.cfg.get("DASH_ACTIVE", "")
-        via = {"ts": " · Tailscale", "ssh": " · plain SSH"}.get(active, "")
-        self.sub_title = f"{self.cfg.get('INSTANCE_ID','?')}{via}"
+        mode = core.mode_of(self.cfg)
+        via = {"ts": " · Tailscale", "ssh": " · SSH", "both": " · TS→SSH"}.get(mode, "")
+        arrow = {"send": " →", "receive": " ←", "bidir": " ⇄"}.get(core.direction_of(self.cfg), "")
+        self.sub_title = f"{self.cfg.get('INSTANCE_ID','?')}{via}{arrow}"
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -484,7 +675,7 @@ class OsyncDash(App):
         h.update(health_render(self.cfg, state, local, remote))
         self.query_one("#p_devices", Panel).update(devices_render(self.cfg, self.tgt, local, remote))
         self.query_one("#p_state", Panel).update(state_render(self.cfg, state))
-        self.query_one("#p_paths", Panel).update(paths_render(self.cfg, self.tgt))
+        self.query_one("#p_paths", Panel).update(paths_render(self.cfg, self.tgt, remote))
         self.query_one("#p_safety", Panel).update(safety_render(self.cfg, self.tgt, local, remote))
 
     def _apply_pending(self):
@@ -521,13 +712,22 @@ class OsyncDash(App):
         with self.suspend():
             subprocess.run([os.environ.get("PAGER", "less"), "+G", logf])
 
-    def action_toggle_endpoint(self):
-        new, msg = core.toggle_endpoint(self.cfg_path)
+    def action_cycle_mode(self):
+        new, msg = core.cycle_mode(self.cfg_path)
         if not new:
             self.notify(msg, severity="warning")
             return
         self._load_cfg()
         self.notify(msg, severity="information")
+        self.refresh_data()
+
+    def action_cycle_direction(self):
+        order = ["bidir", "send", "receive"]
+        cur = core.direction_of(self.cfg)
+        new = order[(order.index(cur) + 1) % 3] if cur in order else "bidir"
+        core.set_direction(self.cfg_path, new)
+        self._load_cfg()
+        self.notify(f"direction: {DIR_LABEL[new][0]}", severity="information")
         self.refresh_data()
 
     def _switch_to(self, path, msg=None):
@@ -553,11 +753,7 @@ class OsyncDash(App):
             self._switch_to(result, f"→ {core.parse_config(Path(result)).get('INSTANCE_ID','?')}")
 
     def action_add_host(self):
-        devices = []
-        for v in core.tailscale_map().values():
-            if v.get("name") and v["name"] not in devices:
-                devices.append(v["name"])
-        self.push_screen(AddHost(sorted(devices)), self._added)
+        self.push_screen(AddHost(core.ts_devices()), self._added)
 
     def _added(self, path):
         if not path:
