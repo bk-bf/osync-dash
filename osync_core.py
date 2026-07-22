@@ -947,25 +947,31 @@ def pending_deletions(pending: dict | None) -> int:
 
 
 def guarded_sync(name: str) -> int:
-    """Run one sync for `name`, but refuse first if the dry-run would propagate
-    more deletions than `delete_guard`. This is what the systemd units call, so
-    the guard protects *automatic* syncs, not just the ones you trigger by hand.
-    Returns an exit code (0 ok · 3 blocked · other = osync's code)."""
+    """Run one sync for `name` — but first do a dry-run to (a) skip the real
+    sync entirely when nothing has changed, so a periodic timer doesn't spin up
+    a full osync pass every interval for no reason, and (b) refuse if it would
+    propagate more deletions than `delete_guard`. This is what the systemd units
+    call, so both protections apply to *automatic* syncs, not just manual ones.
+    Returns an exit code (0 ok/idle · 3 blocked · other = osync's code)."""
     defaults, conns = parse_compose()
     conn = next((c for c in conns if c.get("name") == name), None)
     if not conn:
         sys.stderr.write(f"osync-dash: no connection '{name}'\n")
         return 2
     cfg, _ = connection_to_cfg(conn, defaults)
+    pend = compute_pending(cfg["_configfile"])
+    # in sync → don't do the work. (pend is None when the dry-run couldn't be
+    # computed, e.g. target unreachable — fall through and let osync report it.)
+    if pend is not None and pend["total"] == 0:
+        sys.stderr.write(f"{name}: already in sync — nothing to do\n")
+        return 0
     guard = int(parse_settings().get("delete_guard", 0) or 0)
-    if guard > 0:
-        pend = compute_pending(cfg["_configfile"])
-        dels = pending_deletions(pend)
-        if dels > guard:
-            msg = f"{name}: {dels} deletions exceed the guard of {guard} — sync skipped."
-            notify("osync-dash · sync blocked", msg)
-            sys.stderr.write(msg + " Raise delete_guard or sync manually to override.\n")
-            return 3
+    dels = pending_deletions(pend)
+    if guard > 0 and dels > guard:
+        msg = f"{name}: {dels} deletions exceed the guard of {guard} — sync skipped."
+        notify("osync-dash · sync blocked", msg)
+        sys.stderr.write(msg + " Raise delete_guard or sync manually to override.\n")
+        return 3
     rc = subprocess.run([OSYNC_BIN, cfg["_configfile"], "--summary", "--no-prefix"]).returncode
     if rc != 0:
         notify("osync-dash · sync failed", f"{name}: osync exited with code {rc}")
