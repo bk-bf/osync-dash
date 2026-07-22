@@ -182,6 +182,16 @@ is simply *two* pushes — one owned by each side — so there's no central
 initiator and no shared lock to fight over. "Pulling" a peer's change is just
 that peer pushing to you.
 
+**Netmap-style POV.** Run osd on every node and each shows the mesh from *its*
+side: **outgoing** cards (the pushes in this node's compose) and **incoming**
+cards (peers pushing *to* this node). Incoming is discovered with no central
+registry — when a node sets up a push, it drops a tiny beacon
+(`~/.config/osync/incoming/<node>--<conn>.toml`) on the target over ssh; the
+target reads those and shows `← from <node>` cards with the received dir's file
+count and freshness. So from a receive-only box like a server you'll see
+`← cachyos : documents → /srv/docs (350 files, newest 2d ago)` even though it has
+no connections of its own.
+
 Push/pull connections carry rsync `--update`, which means **newest change wins**
 without a merge step: a push never overwrites a file that's newer on the
 receiver, so whichever version is newest ends up on both sides regardless of who
