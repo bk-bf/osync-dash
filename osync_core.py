@@ -249,8 +249,14 @@ def probe_local(sync_dir: Path, baseline=None) -> dict:
     except OSError:
         d["free"] = d["disk_total"] = d["disk_used"] = None
     wd = sync_dir / OSYNC_DIR
-    d["deleted"] = sum(1 for _ in (wd / "deleted").rglob("*") if _.is_file()) if (wd / "deleted").is_dir() else 0
-    d["backup"] = sum(1 for _ in (wd / "backup").rglob("*") if _.is_file()) if (wd / "backup").is_dir() else 0
+
+    def _count(p):  # rglob can race osync writing soft-deletes/backups mid-sync
+        try:
+            return sum(1 for x in p.rglob("*") if x.is_file()) if p.is_dir() else 0
+        except OSError:
+            return 0
+    d["deleted"] = _count(wd / "deleted")
+    d["backup"] = _count(wd / "backup")
     return d
 
 
@@ -311,24 +317,37 @@ def sync_running(sync_dir: Path) -> bool:
         return False
 
 
+def _state_text(p: Path) -> str | None:
+    # osync rewrites these constantly mid-sync, so read defensively — a file that
+    # vanishes between check and read must not raise (it just reads as unknown).
+    try:
+        return p.read_text(errors="replace").strip()
+    except OSError:
+        return None
+
+
+def _state_mtime(p: Path) -> float | None:
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return None
+
+
 def probe_state(cfg: dict, sync_dir: Path) -> dict:
     inst = cfg.get("INSTANCE_ID", "")
     sd = sync_dir / OSYNC_DIR / "state"
     d = {"instance": inst, "running": False, "last_ts": None,
          "init_action": None, "tgt_action": None, "resume": None}
-    la = sd / f"initiator-last-action-{inst}"
-    if la.exists():
-        d["last_ts"] = la.stat().st_mtime
-        d["init_action"] = la.read_text(errors="replace").strip()
-    ta = sd / f"target-last-action-{inst}"
-    if ta.exists():
-        d["tgt_action"] = ta.read_text(errors="replace").strip()
-    rc = sd / f"resume-count-{inst}"
-    if rc.exists():
-        d["resume"] = rc.read_text(errors="replace").strip()
+    d["last_ts"] = _state_mtime(sd / f"initiator-last-action-{inst}")
+    d["init_action"] = _state_text(sd / f"initiator-last-action-{inst}")
+    d["tgt_action"] = _state_text(sd / f"target-last-action-{inst}")
+    d["resume"] = _state_text(sd / f"resume-count-{inst}")
     # running? lock file in state dir or a live osync process for this config
-    if sd.is_dir() and any(p.name.endswith(".lock") or p.name == "lock" for p in sd.iterdir()):
-        d["running"] = True
+    try:
+        if sd.is_dir() and any(p.name.endswith(".lock") or p.name == "lock" for p in sd.iterdir()):
+            d["running"] = True
+    except OSError:
+        pass
     rc2, out = run(["pgrep", "-fa", "osync.sh"], timeout=5)
     if rc2 == 0 and inst:
         for line in out.splitlines():
@@ -1330,8 +1349,7 @@ def gather(cfg, tgt, local_only=False):
     # baseline = last successful sync time; both replicas were identical then, so
     # anything with a newer mtime is a live change waiting to sync (git-style).
     inst = cfg.get("INSTANCE_ID", "")
-    la = sync_dir / OSYNC_DIR / "state" / f"initiator-last-action-{inst}"
-    baseline = la.stat().st_mtime if la.exists() else None
+    baseline = _state_mtime(sync_dir / OSYNC_DIR / "state" / f"initiator-last-action-{inst}")
     local = probe_local(sync_dir, baseline)
     remote = {"reach": False, "err": "skipped"}
     if tgt.get("remote") and not local_only:
