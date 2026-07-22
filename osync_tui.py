@@ -191,9 +191,6 @@ def auto_line(cfg, auto_st) -> Text:
     elif st.get("active"):
         t.append("⟳ ", style=MINT)
         t.append(desc, style=MINT)
-        nxt = st.get("next_ts")
-        if nxt is not None:
-            t.append(f"  · next in {core.human_age(max(0, nxt - core.time.time()))}", style=MUTED)
         if st.get("last_ok"):
             t.append("  · last ok", style=MUTED)
     else:
