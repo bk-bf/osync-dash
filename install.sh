@@ -7,9 +7,12 @@
 # every node runs the exact same osync build — behaviour and log format matched.
 #
 # Usage:
-#   install.sh [BINDIR]              install here (BINDIR defaults to ~/.local/bin)
-#   install.sh --remote user@host    copy the pinned osync onto a remote replica
-#   install.sh --print-osync         print the path to the vendored osync.sh
+#   install.sh [BINDIR]                 install here (BINDIR defaults to ~/.local/bin)
+#   install.sh --remote user@host       copy the pinned osync onto a remote replica
+#   install.sh --print-osync            print the path to the vendored osync.sh
+#   install.sh --uninstall [--yes]      remove osync-dash, its osync, units, and
+#                                       every setup it created on this machine
+#   install.sh --uninstall --purge-remote   also wipe .osync_workdir on replicas
 #
 # Env: OSYNC_DASH_HOME (default ~/.local/share/osync-dash), OSYNC_DASH_REPO.
 set -euo pipefail
@@ -20,6 +23,106 @@ PREFIX="${OSYNC_DASH_HOME:-$HOME/.local/share/osync-dash}"
 say() { printf '→ %s\n' "$*"; }
 die() { printf 'osync-dash install: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+# ── uninstall — removes everything this installer + the TUI ever created ──────
+# Handled before anything else so it never clones a source tree just to delete.
+uninstall() {
+  local purge_remote=0 yes=0 a
+  for a in "$@"; do
+    case "$a" in
+      --purge-remote) purge_remote=1 ;;
+      --yes|-y)       yes=1 ;;
+      *) die "unknown uninstall flag: $a" ;;
+    esac
+  done
+  local compose="$HOME/.config/osync/osync-dash.toml"
+  local cache="$HOME/.cache/osync"
+
+  # read each connection's dirs from the compose *before* deleting it
+  local conns=""
+  if [ -f "$compose" ] && command -v python3 >/dev/null 2>&1; then
+    conns="$(python3 - "$compose" <<'PY' || true
+import sys, os
+try:
+    import tomllib
+    d = tomllib.load(open(sys.argv[1], "rb"))
+except Exception:
+    raise SystemExit
+defs = d.get("defaults") or {}
+for c in d.get("connection") or []:
+    row = [os.path.expanduser(str(c.get("local", ""))),
+           str(c.get("user") or defs.get("user", "")),
+           str(c.get("ts_host") or c.get("ssh_host") or ""),
+           str(c.get("ts_port") or c.get("ssh_port") or 22),
+           os.path.expanduser(str(c.get("key") or defs.get("key", "") or "")),
+           str(c.get("remote", ""))]
+    print("\t".join(row))
+PY
+)"
+  fi
+
+  echo "osync-dash uninstall will remove:"
+  echo "  • the launcher symlink(s) and $PREFIX (src, vendored osync, venv)"
+  echo "  • all systemd --user units  osync-dash-*  (stopped + disabled)"
+  echo "  • $cache/generated and $cache/*.log"
+  echo "  • the compose file  $compose"
+  echo "  • .osync_workdir in each LOCAL synced dir"
+  echo "    ⚠ that deletes osync's soft-delete + conflict-backup safety net"
+  [ "$purge_remote" = 1 ] && echo "  • .osync_workdir on each REMOTE replica too (--purge-remote)"
+  echo "  Your actual synced files are left untouched."
+  echo
+  if [ "$yes" != 1 ]; then
+    [ -t 0 ] || die "non-interactive shell — re-run with --yes to confirm"
+    read -rp "Proceed? [y/N] " a; case "$a" in y|Y|yes|YES) ;; *) echo "aborted."; exit 1 ;; esac
+  fi
+
+  # 1. systemd units
+  if command -v systemctl >/dev/null 2>&1; then
+    for a in $(systemctl --user list-unit-files --no-legend 'osync-dash-*' 2>/dev/null | awk '{print $1}'); do
+      systemctl --user disable --now "$a" >/dev/null 2>&1 || true
+    done
+    rm -f "$HOME/.config/systemd/user/"osync-dash-*.service \
+          "$HOME/.config/systemd/user/"osync-dash-*.timer 2>/dev/null || true
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    say "removed systemd units"
+  fi
+
+  # 2. .osync_workdir in the synced dirs (local always; remote if asked)
+  if [ -n "$conns" ]; then
+    local L U H P K R opts
+    while IFS=$'\t' read -r L U H P K R; do
+      [ -n "$L" ] && [ -d "$L/.osync_workdir" ] && rm -rf "$L/.osync_workdir" && say "removed $L/.osync_workdir"
+      if [ "$purge_remote" = 1 ] && [ -n "$H" ] && [ -n "$R" ]; then
+        opts=(-o BatchMode=yes -o ConnectTimeout=6 -o ControlPath=none -p "$P")
+        [ -n "$K" ] && [ -f "$K" ] && opts+=(-i "$K")
+        if ssh "${opts[@]}" "$U@$H" "rm -rf \"$R/.osync_workdir\"" 2>/dev/null; then
+          say "removed $U@$H:$R/.osync_workdir"
+        else
+          say "! could not reach $H — left $R/.osync_workdir in place"
+        fi
+      fi
+    done <<< "$conns"
+  fi
+
+  # 3. compose + cache (keep any hand-written legacy *.conf; rmdir only if empty)
+  rm -f "$compose"; rmdir "$HOME/.config/osync" 2>/dev/null || true
+  rm -rf "$cache/generated"; rm -f "$cache/"*.log 2>/dev/null || true
+  rmdir "$cache" 2>/dev/null || true
+  say "removed compose + cache"
+
+  # 4. launcher symlinks (only if they're symlinks — never a real file)
+  for a in "$HOME/.local/bin/osync-dash" "$HOME/bin/osync-dash" "/usr/local/bin/osync-dash"; do
+    [ -L "$a" ] && rm -f "$a" && say "removed $a"
+  done
+  a="$(command -v osync-dash 2>/dev/null || true)"
+  [ -n "$a" ] && [ -L "$a" ] && rm -f "$a" && say "removed $a"
+
+  # 5. the install prefix (vendored osync + venv + src) — last, we may run from it
+  rm -rf "$PREFIX"; say "removed $PREFIX"
+  echo; echo "osync-dash uninstalled."
+}
+
+if [ "${1:-}" = "--uninstall" ]; then shift; uninstall "$@"; exit 0; fi
 
 # ── locate (or fetch) the source tree ────────────────────────────────────────
 # When run from a checkout we use it in place; when piped through curl we clone.
@@ -95,3 +198,4 @@ echo "done. Ensure $BIN is on your PATH, then run:"
 echo "    osync-dash                        # the TUI"
 echo "    osync-dash --print                # one-shot render"
 echo "    $SRC/install.sh --remote user@host  # match osync on a replica"
+echo "    $SRC/install.sh --uninstall         # remove everything"

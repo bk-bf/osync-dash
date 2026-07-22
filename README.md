@@ -92,6 +92,21 @@ is a single self-contained script):
 Bump a version by editing `versions.env` and re-running `install.sh` (and
 `--remote` for each replica).
 
+### Uninstall
+
+```sh
+~/.local/share/osync-dash/src/install.sh --uninstall
+```
+
+Prompts, then removes **everything on this machine** it created: the launcher
+symlink, the install prefix (vendored osync + venv), all `osync-dash-*` systemd
+units (stopped + disabled), the generated confs and logs, the compose file, and
+`.osync_workdir` in each local synced dir. Add `--purge-remote` to also wipe
+`.osync_workdir` on the replicas over ssh, or `--yes` to skip the prompt. **Your
+actual synced files are never touched** — only osync's state/backup dirs are
+(note that removes the soft-delete/conflict-backup safety net). Hand-written
+legacy `~/.config/osync/*.conf` are also left alone.
+
 ## Usage
 
 ```sh
