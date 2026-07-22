@@ -53,6 +53,10 @@ COMPOSE_FILE = CONFIG_HOME / "osync-dash.toml"
 GEN_DIR = Path(os.path.expanduser("~/.cache/osync/generated"))
 COMPOSE_DEFAULTS = {"user": os.environ.get("USER", ""), "key": "~/.ssh/id_ed25519",
                     "soft_delete_days": 30, "conflict_backup_days": 30}
+# global [settings] — portable across machines (notify command is configurable
+# so it isn't hard-wired to notify-send). delete_guard = block a sync whose
+# dry-run would propagate more than N deletions (0 disables the guard).
+SETTINGS_DEFAULTS = {"notify": True, "notify_cmd": "notify-send", "delete_guard": 25}
 STALE_AFTER = 24 * 3600  # a sync older than this flips health to STALE
 
 # ── ANSI ────────────────────────────────────────────────────────────────────
@@ -755,6 +759,24 @@ def parse_compose() -> tuple[dict, list[dict]]:
     return defaults, conns
 
 
+def parse_settings() -> dict:
+    if not COMPOSE_FILE.exists():
+        return dict(SETTINGS_DEFAULTS)
+    try:
+        with open(COMPOSE_FILE, "rb") as f:
+            data = tomllib.load(f)
+    except (tomllib.TOMLDecodeError, OSError):
+        return dict(SETTINGS_DEFAULTS)
+    return {**SETTINGS_DEFAULTS, **(data.get("settings") or {})}
+
+
+def save_settings(updates: dict) -> dict:
+    s = {**parse_settings(), **updates}
+    defaults, conns = parse_compose()
+    dump_compose(defaults, conns, s)
+    return s
+
+
 def _toml_val(v) -> str:
     if isinstance(v, bool):
         return "true" if v else "false"
@@ -766,15 +788,22 @@ def _toml_val(v) -> str:
 # key order for readable, stable output
 _CONN_ORDER = ["name", "local", "remote", "direction", "mode", "user", "key",
                "ts_host", "ts_port", "ssh_host", "ssh_port", "exclude",
-               "auto", "interval"]
+               "auto", "interval", "at"]
 
 
-def dump_compose(defaults: dict, conns: list[dict]) -> None:
-    """Serialise the compose file (tool-managed; hand comments are not kept)."""
+def dump_compose(defaults: dict, conns: list[dict], settings: dict | None = None) -> None:
+    """Serialise the compose file (tool-managed; hand comments are not kept).
+    `settings` defaults to the file's current [settings] so any writer preserves
+    it without having to know about it."""
+    if settings is None:
+        settings = parse_settings()
     lines = ["# osync-dash compose — one file, many sync connections.",
              "# Managed by osync-dash (a add · t endpoint · d direction), editable by hand.",
              "# Each [[connection]] is a two-way osync job between this machine and a host.",
-             "", "[defaults]"]
+             "", "[settings]"]
+    for k, v in settings.items():
+        lines.append(f"{k} = {_toml_val(v)}")
+    lines += ["", "[defaults]"]
     for k, v in defaults.items():
         lines.append(f"{k} = {_toml_val(v)}")
     for c in conns:
@@ -809,6 +838,9 @@ def remove_connection(name: str) -> None:
     dump_compose(defaults, [c for c in conns if c.get("name") != name])
     if have_systemd():
         _write_units(name, "off", 15, "")  # stop + remove any auto units
+    gen = GEN_DIR / f"{_slug(name)}.conf"
+    if gen.exists():
+        gen.unlink()
 
 
 def _conn_fields(conn: dict, defaults: dict) -> dict:
@@ -844,6 +876,7 @@ def connection_to_cfg(conn: dict, defaults: dict) -> tuple[dict, dict]:
     cfg["_connection"] = conn["name"]
     cfg["_auto"] = conn.get("auto", "off")
     cfg["_interval"] = parse_duration(conn.get("interval", "15m"))["human"]
+    cfg["_at"] = conn.get("at", "")
     tgt = parse_target(cfg.get("TARGET_SYNC_DIR", ""))
     return cfg, tgt
 
@@ -883,6 +916,62 @@ def set_direction_conn(name: str, direction: str) -> None:
     update_connection(name, {"direction": direction})
 
 
+# ── notifications + deletion guard ───────────────────────────────────────────
+# absolute path to the launcher, for systemd ExecStart (resolves through the
+# ~/.local/bin symlink back to the repo).
+LAUNCHER = Path(__file__).resolve().parent / "osync-dash"
+
+
+def notify(title: str, body: str = "") -> None:
+    """Best-effort desktop notification via the configured command. The command
+    is a setting (default notify-send) so this stays portable — any tool taking
+    `<cmd> [args] TITLE BODY` works (notify-send, dunstify, a wrapper script…)."""
+    s = parse_settings()
+    if not s.get("notify", True):
+        return
+    cmd = str(s.get("notify_cmd", "notify-send")).strip()
+    if not cmd:
+        return
+    parts = cmd.split()
+    exe = parts[0]
+    if not (shutil.which(exe) or os.path.exists(os.path.expanduser(exe))):
+        return
+    try:
+        run(parts + [title, body], timeout=6)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def pending_deletions(pending: dict | None) -> int:
+    return 0 if not pending else int(pending.get("id", 0)) + int(pending.get("td", 0))
+
+
+def guarded_sync(name: str) -> int:
+    """Run one sync for `name`, but refuse first if the dry-run would propagate
+    more deletions than `delete_guard`. This is what the systemd units call, so
+    the guard protects *automatic* syncs, not just the ones you trigger by hand.
+    Returns an exit code (0 ok · 3 blocked · other = osync's code)."""
+    defaults, conns = parse_compose()
+    conn = next((c for c in conns if c.get("name") == name), None)
+    if not conn:
+        sys.stderr.write(f"osync-dash: no connection '{name}'\n")
+        return 2
+    cfg, _ = connection_to_cfg(conn, defaults)
+    guard = int(parse_settings().get("delete_guard", 0) or 0)
+    if guard > 0:
+        pend = compute_pending(cfg["_configfile"])
+        dels = pending_deletions(pend)
+        if dels > guard:
+            msg = f"{name}: {dels} deletions exceed the guard of {guard} — sync skipped."
+            notify("osync-dash · sync blocked", msg)
+            sys.stderr.write(msg + " Raise delete_guard or sync manually to override.\n")
+            return 3
+    rc = subprocess.run([OSYNC_BIN, cfg["_configfile"], "--summary", "--no-prefix"]).returncode
+    if rc != 0:
+        notify("osync-dash · sync failed", f"{name}: osync exited with code {rc}")
+    return rc
+
+
 # ── automatic sync via systemd --user units ──────────────────────────────────
 # off → manual only · change → osync --on-changes daemon (inotify) · periodic →
 # oneshot service fired by a timer every `interval` minutes.
@@ -916,7 +1005,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 Environment=PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin
-ExecStart={osync} {conf} --summary --silent
+ExecStart={launcher} --guarded-sync {name}
 """
 
 _TIMER = """\
@@ -926,6 +1015,18 @@ Description=osync-dash periodic sync timer — {name}
 [Timer]
 OnActiveSec={interval}
 OnUnitActiveSec={interval}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+_TIMER_CAL = """\
+[Unit]
+Description=osync-dash scheduled sync timer — {name}
+
+[Timer]
+OnCalendar={calendar}
 Persistent=true
 
 [Install]
@@ -985,7 +1086,7 @@ def auto_mode(conn: dict) -> str:
     return m if m in AUTO_MODES else "off"
 
 
-def _write_units(name: str, mode: str, interval: int, conf: str) -> None:
+def _write_units(name: str, mode: str, interval, conf: str, calendar: str = "") -> None:
     base = _unit_base(name)
     svc, tmr = SYSTEMD_USER_DIR / f"{base}.service", SYSTEMD_USER_DIR / f"{base}.timer"
     # tear the old pair down first, whatever it was
@@ -1000,17 +1101,21 @@ def _write_units(name: str, mode: str, interval: int, conf: str) -> None:
         _systemctl("daemon-reload")
         _systemctl("enable", "--now", f"{base}.service")
     elif mode == "periodic":
-        svc.write_text(_SVC_ONESHOT.format(name=name, osync=OSYNC_BIN, conf=conf))
-        tmr.write_text(_TIMER.format(name=name, interval=parse_duration(interval)["systemd"]))
+        svc.write_text(_SVC_ONESHOT.format(name=name, launcher=LAUNCHER))
+        if calendar:
+            tmr.write_text(_TIMER_CAL.format(name=name, calendar=calendar))
+        else:
+            tmr.write_text(_TIMER.format(name=name, interval=parse_duration(interval)["systemd"]))
         _systemctl("daemon-reload")
         _systemctl("enable", "--now", f"{base}.timer")
     else:
         _systemctl("daemon-reload")
 
 
-def set_auto(name: str, mode: str, interval: int | None = None) -> tuple[str, str]:
+def set_auto(name: str, mode: str, interval=None, calendar: str | None = None) -> tuple[str, str]:
     """Persist a connection's auto mode in the compose file and (re)configure
-    its systemd --user units. Returns (mode, human message)."""
+    its systemd --user units. `calendar` (a systemd OnCalendar spec) takes
+    precedence over `interval` for periodic mode. Returns (mode, message)."""
     if mode not in AUTO_MODES:
         mode = "off"
     defaults, conns = parse_compose()
@@ -1018,20 +1123,29 @@ def set_auto(name: str, mode: str, interval: int | None = None) -> tuple[str, st
     if not conn:
         return "off", "connection not found"
     conn["auto"] = mode
-    if interval:
+    if calendar:
+        conn["at"] = calendar.strip()
+    elif interval:
         conn["interval"] = parse_duration(interval)["store"]
+        conn.pop("at", None)  # switching back to an interval clears any calendar
     dump_compose(defaults, conns)
     if not have_systemd():
         return mode, f"auto = {mode} saved (no systemctl — start osync yourself)"
     if mode == "change" and not shutil.which("inotifywait"):
         return mode, "on-change needs inotify-tools (inotifywait) installed"
     conf = str(materialize(conn, defaults))
+    at = conn.get("at", "") if calendar or conn.get("at") else ""
     try:
-        _write_units(name, mode, conn.get("interval", "15m"), conf)
+        _write_units(name, mode, conn.get("interval", "15m"), conf, calendar=at)
     except Exception as e:  # noqa: BLE001
         return mode, f"auto = {mode}, but unit setup failed: {e}"
-    every = f" (every {parse_duration(conn.get('interval', '15m'))['human']})" if mode == "periodic" else ""
-    return mode, f"auto sync: {AUTO_LABEL[mode]}{every}"
+    if mode != "periodic":
+        when = ""
+    elif at:
+        when = f" (at {at})"
+    else:
+        when = f" (every {parse_duration(conn.get('interval', '15m'))['human']})"
+    return mode, f"auto sync: {AUTO_LABEL[mode]}{when}"
 
 
 def cycle_auto(name: str) -> tuple[str, str]:
@@ -1043,16 +1157,62 @@ def cycle_auto(name: str) -> tuple[str, str]:
     return set_auto(name, AUTO_MODES[(AUTO_MODES.index(cur) + 1) % len(AUTO_MODES)])
 
 
-def auto_active(name: str) -> bool:
-    """Is the connection's auto unit currently active? (cheap best-effort)"""
+_SPAN_UNITS = {"us": 1e-6, "ms": 1e-3, "s": 1, "sec": 1, "seconds": 1,
+               "m": 60, "min": 60, "minutes": 60, "h": 3600, "hr": 3600, "hours": 3600,
+               "d": 86400, "day": 86400, "days": 86400,
+               "w": 604800, "week": 604800, "weeks": 604800}
+
+
+def _parse_span(s) -> float | None:
+    """Parse a systemd time span like '1d 8h 8min 15.04s' into seconds."""
+    total, found = 0.0, False
+    for tok in str(s).split():
+        m = re.match(r"^([\d.]+)([a-z]+)$", tok)
+        if m and m.group(2) in _SPAN_UNITS:
+            total += float(m.group(1)) * _SPAN_UNITS[m.group(2)]
+            found = True
+    return total if found else None
+
+
+def _show(unit: str, props: list[str]) -> dict:
+    rc, out = _systemctl("show", unit, "-p", ",".join(props), timeout=6)
+    d = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            d[k] = v
+    return d
+
+
+def auto_status(name: str) -> dict:
+    """Live systemd state for a connection's auto units, for the card display.
+    {loaded, active, failed, next_secs, last_ok}. All best-effort / cheap."""
+    st = {"loaded": False, "active": False, "failed": False,
+          "next_secs": None, "last_ok": None}
     if not have_systemd():
-        return False
+        return st
     base = _unit_base(name)
-    for unit in (f"{base}.timer", f"{base}.service"):
-        rc, out = _systemctl("is-active", unit, timeout=6)
-        if out.strip() == "active":
-            return True
-    return False
+    tm = _show(f"{base}.timer", ["LoadState", "ActiveState",
+                                 "NextElapseUSecRealtime", "NextElapseUSecMonotonic"])
+    sv = _show(f"{base}.service", ["LoadState", "ActiveState", "Result"])
+    st["loaded"] = "loaded" in (tm.get("LoadState"), sv.get("LoadState"))
+    st["active"] = "active" in (tm.get("ActiveState"), sv.get("ActiveState"))
+    st["failed"] = ("failed" in (tm.get("ActiveState"), sv.get("ActiveState"))
+                    or sv.get("Result") not in (None, "", "success"))
+    res = sv.get("Result")
+    if res:
+        st["last_ok"] = res == "success"
+    # interval timers (OnActiveSec/OnUnitActiveSec) report a MONOTONIC next
+    # elapse, which systemctl prints as a span ("1d 8h 8min 15s") relative to
+    # boot — parse it and diff against time.monotonic(). (Calendar timers use a
+    # realtime date string we don't bother parsing; the countdown just hides.)
+    raw = tm.get("NextElapseUSecMonotonic", "")
+    mono = _parse_span(raw)
+    if mono is None and raw.isdigit():
+        mono = int(raw) / 1e6
+    if mono is not None:
+        st["next_secs"] = max(0, mono - time.monotonic())
+    return st
 
 
 def migrate_legacy() -> bool:
@@ -1186,6 +1346,9 @@ def main():
             print(__doc__); return
         elif a in ("-c", "--config"):
             i += 1; o["config"] = args[i]
+        elif a == "--guarded-sync":
+            i += 1
+            sys.exit(guarded_sync(args[i]))  # systemd ExecStart entry point
         elif a in ("-w", "--watch"):
             o["watch"] = True
         elif a in ("-p", "--print", "--once"):

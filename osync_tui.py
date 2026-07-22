@@ -24,7 +24,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll  # noqa: E40
 from textual.screen import ModalScreen  # noqa: E402
 from textual.theme import Theme  # noqa: E402
 from textual.widgets import (Button, Footer, Header, Input, Label, OptionList,  # noqa: E402
-                             RadioButton, RadioSet, Select, Static)
+                             RadioButton, RadioSet, Select, Static, Switch)
 from textual.widgets.option_list import Option  # noqa: E402
 
 # ── ayu palette (from btop's ayu.theme) ──────────────────────────────────────
@@ -168,7 +168,37 @@ def _kv(rows, kw=11) -> Table:
     return t
 
 
-def card_body(name, cfg, tgt, data, pending, pending_running, spin) -> Group:
+def auto_line(cfg, auto_st) -> Text:
+    auto = cfg.get("_auto", "off")
+    if auto == "off":
+        return Text("off — manual (press s)", style=MUTED)
+    if auto == "change":
+        desc = "on file change"
+    elif cfg.get("_at"):
+        desc = f"at {cfg['_at']}"
+    else:
+        desc = f"every {cfg.get('_interval', '15min')}"
+    st = auto_st or {}
+    t = Text()
+    if st.get("failed"):
+        t.append("⚠ ", style=SALMON)
+        t.append(desc, style=SALMON)
+        t.append("  · last run failed — check log (l)", style=SALMON)
+    elif st.get("active"):
+        t.append("⟳ ", style=MINT)
+        t.append(desc, style=MINT)
+        nxt = st.get("next_secs")
+        if nxt is not None:
+            t.append(f"  · next in {core.human_age(nxt)}", style=MUTED)
+        if st.get("last_ok"):
+            t.append("  · last ok", style=MUTED)
+    else:
+        t.append(desc, style=GOLD)
+        t.append("  · not running" + ("" if core.have_systemd() else " (no systemd)"), style=GOLD)
+    return t
+
+
+def card_body(name, cfg, tgt, data, pending, pending_running, spin, auto_st=None) -> Group:
     if data is None:
         return Group(Text("  gathering…", style=MUTED))
     state, local, remote = data
@@ -233,20 +263,11 @@ def card_body(name, cfg, tgt, data, pending, pending_running, spin) -> Group:
     safety.append("   winner ", style=MUTED)
     safety.append("newest", style=MINT)
 
-    auto = cfg.get("_auto", "off")
-    auto_t = Text()
-    if auto == "change":
-        auto_t.append("⟳ on file change", style=MINT)
-    elif auto == "periodic":
-        auto_t.append(f"⟳ every {cfg.get('_interval', '15min')}", style=MINT)
-    else:
-        auto_t.append("off — manual (press s)", style=MUTED)
-
     rows = [
         ("local", Text(cfg.get("INITIATOR_SYNC_DIR", "?"), style=WHITE)),
         ("remote", Text(tgt_s, style=WHITE)),
         ("via", conn),
-        ("auto-sync", auto_t),
+        ("auto-sync", auto_line(cfg, auto_st)),
         ("safety", safety),
         ("log", Text(cfg.get("LOGFILE", "—") or "—", style=MUTED)),
     ]
@@ -398,9 +419,10 @@ class AddHost(ModalScreen):
     """
     BINDINGS = [("escape", "cancel", "Cancel")]
 
-    def __init__(self, devices):
+    def __init__(self, devices, edit=None):
         super().__init__()
         self.devices = devices
+        self.edit = edit  # a compose connection dict when editing, else None
 
     def _mode(self):
         return MODES[self.query_one("#i_mode", RadioSet).pressed_index or 0][1]
@@ -421,8 +443,10 @@ class AddHost(ModalScreen):
                 for d in self.devices]
         opts.append(("✎  manual entry", "__manual__"))
         with Vertical(id="box"):
-            yield Static("＋ add a sync connection", classes="h")
-            yield Static("import a Tailscale device (or enter a host), then pick dirs to sync", classes="sub")
+            yield Static("✎ edit connection" if self.edit else "＋ add a sync connection", classes="h")
+            yield Static("adjust hosts, dirs, direction — the name stays fixed" if self.edit
+                         else "import a Tailscale device (or enter a host), then pick dirs to sync",
+                         classes="sub")
             with VerticalScroll(id="form"):
                 yield Label("device")
                 yield Select(opts, prompt="pick a Tailscale device…", id="i_device", allow_blank=True)
@@ -470,7 +494,30 @@ class AddHost(ModalScreen):
                 yield Button("Create", variant="primary", id="create")
 
     def on_mount(self):
+        if self.edit:
+            self._prefill(self.edit)
         self._sync_mode_rows()
+
+    def _prefill(self, e):
+        def sv(wid, val):
+            self.query_one(f"#{wid}", Input).value = str(val or "")
+        sv("i_name", e.get("name"))
+        self.query_one("#i_name", Input).disabled = True
+        sv("i_user", e.get("user"))
+        sv("i_key", e.get("key") or os.path.expanduser("~/.ssh/id_ed25519"))
+        sv("i_ts", e.get("ts_host")); sv("i_tsport", e.get("ts_port") or "22")
+        sv("i_ssh", e.get("ssh_host")); sv("i_sshport", e.get("ssh_port") or "22")
+        self.query_one("#i_rpath", DirField).set_value(e.get("remote") or "~/")
+        self.query_one("#i_lpath", DirField).set_value(e.get("local") or "~/")
+        self._press(self.query_one("#i_mode", RadioSet),
+                    [i for i, (_, v) in enumerate(MODES) if v == e.get("mode", "ts")])
+        self._press(self.query_one("#i_dir", RadioSet),
+                    [i for i, (_, v) in enumerate(DIRS) if v == e.get("direction", "bidir")])
+
+    def _press(self, rs, idxs):
+        idx = idxs[0] if idxs else 0
+        for i, btn in enumerate(rs.query(RadioButton)):
+            btn.value = (i == idx)
 
     def _sync_mode_rows(self):
         mode = self._mode()
@@ -520,12 +567,15 @@ class AddHost(ModalScreen):
                 "ts_host": ts_host, "ts_port": int(g("i_tsport") or 22),
                 "ssh_host": ssh_host, "ssh_port": int(g("i_sshport") or 22)}
         try:
-            core.add_connection(conn)
+            if self.edit:
+                core.update_connection(name, conn)
+            else:
+                core.add_connection(conn)
         except FileExistsError as e:
             err.update(str(e)); return
         except Exception as e:  # noqa: BLE001
             err.update(f"error: {e}"); return
-        self.dismiss(name)
+        self.dismiss(("edit" if self.edit else "add", name))
 
 
 # ── auto-sync modal ──────────────────────────────────────────────────────────
@@ -533,32 +583,41 @@ AUTO_PRESETS = [("1 minute", "1m"), ("5 minutes", "5m"), ("15 minutes", "15m"),
                 ("30 minutes", "30m"), ("1 hour", "1h"), ("6 hours", "6h"),
                 ("12 hours", "12h"), ("24 hours", "24h"), ("2 days", "2d"),
                 ("3 days", "3d"), ("1 week", "1w"), ("2 weeks", "2w")]
+CAL_PRESETS = [("hourly", "hourly"), ("daily 03:00", "*-*-* 03:00:00"),
+               ("weekdays 09:00", "Mon..Fri 09:00"), ("weekends 12:00", "Sat,Sun 12:00"),
+               ("weekly · Mon 03:00", "Mon *-*-* 03:00:00"),
+               ("monthly · 1st 04:00", "*-*-01 04:00:00")]
 AUTO_RADIO = [("off", "Off — manual only"),
               ("change", "On file change  (live, inotify)"),
-              ("periodic", "Every…  (scheduled)")]
+              ("periodic", "Scheduled…")]
+SCHED_RADIO = [("interval", "Every…  (fixed interval)"),
+               ("calendar", "At…  (calendar: times / weekdays)")]
 
 
 class AutoSyncModal(ModalScreen):
     CSS = """
     AutoSyncModal { align: center middle; background: $background 55%; }
-    #ab { width: 64; height: auto; max-height: 90%; padding: 1 2; background: $panel;
+    #ab { width: 66; height: auto; max-height: 90%; padding: 1 2; background: $panel;
           border: round $secondary; }
     #ab .h { color: $secondary; text-style: bold; }
     #ab .sub { color: $foreground-muted; margin-bottom: 1; }
     #ab Label { color: $foreground-muted; margin-top: 1; }
     #ab RadioSet { border: none; height: auto; }
-    #sched { height: auto; }
+    #sched, #iv_row, #cal_row { height: auto; }
     #ab Input { border: tall $panel-lighten-2; }
     #abtns { height: auto; align-horizontal: right; margin-top: 1; }
     #abtns Button { margin-left: 2; }
     """
     BINDINGS = [("escape", "cancel", "Cancel")]
 
-    def __init__(self, name, cur_mode, cur_interval):
+    def __init__(self, name, cur_mode, cur_interval, cur_at=""):
         super().__init__()
         self.cname = name
         self.cur_mode = cur_mode if cur_mode in ("off", "change", "periodic") else "off"
         self.cur_interval = cur_interval or "15m"
+        self.cur_at = cur_at or ""
+        self.iv_match = next((v for _, v in AUTO_PRESETS if v == self.cur_interval), None)
+        self.cal_match = next((v for _, v in CAL_PRESETS if v == self.cur_at), None)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="ab"):
@@ -568,29 +627,45 @@ class AutoSyncModal(ModalScreen):
                 for key, label in AUTO_RADIO:
                     yield RadioButton(label, value=(key == self.cur_mode))
             with Vertical(id="sched"):
-                yield Label("run every (pick one, or type a custom interval)")
-                preset_match = next((v for _, v in AUTO_PRESETS if v == self.cur_interval), None)
-                yield Select(AUTO_PRESETS, value=preset_match or Select.BLANK,
-                             prompt="pick an interval…", id="a_preset", allow_blank=True)
-                yield Input(value="" if preset_match else self.cur_interval,
-                            placeholder="custom: 90m · 3d · 2w", id="a_custom")
+                with RadioSet(id="a_sched"):
+                    for key, label in SCHED_RADIO:
+                        yield RadioButton(label, value=(key == ("calendar" if self.cur_at else "interval")))
+                with Vertical(id="iv_row"):
+                    yield Label("run every (pick one, or type a custom interval)")
+                    yield Select(AUTO_PRESETS, prompt="pick an interval…", id="a_preset", allow_blank=True)
+                    yield Input(value="" if self.iv_match else self.cur_interval,
+                                placeholder="custom: 90m · 3d · 2w", id="a_custom")
+                with Vertical(id="cal_row"):
+                    yield Label("run at (pick one, or a custom systemd OnCalendar)")
+                    yield Select(CAL_PRESETS, prompt="pick a schedule…", id="a_calpreset", allow_blank=True)
+                    yield Input(value="" if self.cal_match else self.cur_at,
+                                placeholder="custom: Mon..Fri 18:00 · *-*-* 02:30:00", id="a_calcustom")
             with Horizontal(id="abtns"):
                 yield Button("Cancel", id="a_cancel")
                 yield Button("Save", variant="primary", id="a_save")
 
     def on_mount(self):
-        self._sync_sched()
+        if self.iv_match:
+            self.query_one("#a_preset", Select).value = self.iv_match
+        if self.cal_match:
+            self.query_one("#a_calpreset", Select).value = self.cal_match
+        self._sync_vis()
 
     def _mode(self):
-        idx = self.query_one("#a_mode", RadioSet).pressed_index or 0
-        return AUTO_RADIO[idx][0]
+        return AUTO_RADIO[self.query_one("#a_mode", RadioSet).pressed_index or 0][0]
 
-    def _sync_sched(self):
-        self.query_one("#sched").display = self._mode() == "periodic"
+    def _sched_kind(self):
+        return SCHED_RADIO[self.query_one("#a_sched", RadioSet).pressed_index or 0][0]
 
-    @on(RadioSet.Changed, "#a_mode")
-    def _mode_changed(self, e):
-        self._sync_sched()
+    def _sync_vis(self):
+        periodic = self._mode() == "periodic"
+        self.query_one("#sched").display = periodic
+        self.query_one("#iv_row").display = periodic and self._sched_kind() == "interval"
+        self.query_one("#cal_row").display = periodic and self._sched_kind() == "calendar"
+
+    @on(RadioSet.Changed)
+    def _radio_changed(self, e):
+        self._sync_vis()
 
     def action_cancel(self):
         self.dismiss(None)
@@ -602,12 +677,112 @@ class AutoSyncModal(ModalScreen):
     @on(Button.Pressed, "#a_save")
     def _save(self):
         mode = self._mode()
-        interval = None
+        interval = calendar = None
         if mode == "periodic":
-            custom = self.query_one("#a_custom", Input).value.strip()
-            sel = self.query_one("#a_preset", Select).value
-            interval = custom or (sel if sel != Select.BLANK else self.cur_interval)
-        self.dismiss((mode, interval))
+            if self._sched_kind() == "calendar":
+                cc = self.query_one("#a_calcustom", Input).value.strip()
+                cs = self.query_one("#a_calpreset", Select).value
+                calendar = cc or (cs if cs != Select.BLANK else self.cur_at) or "daily"
+            else:
+                ic = self.query_one("#a_custom", Input).value.strip()
+                iss = self.query_one("#a_preset", Select).value
+                interval = ic or (iss if iss != Select.BLANK else self.cur_interval)
+        self.dismiss((mode, interval, calendar))
+
+
+# ── settings + confirm modals ────────────────────────────────────────────────
+class SettingsModal(ModalScreen):
+    CSS = """
+    SettingsModal { align: center middle; background: $background 55%; }
+    #sb { width: 66; height: auto; padding: 1 2; background: $panel; border: round $primary; }
+    #sb .h { color: $primary; text-style: bold; }
+    #sb .sub { color: $foreground-muted; margin-bottom: 1; }
+    #sb Label { color: $foreground-muted; margin-top: 1; }
+    #sb Input { border: tall $panel-lighten-2; }
+    .switchrow { height: auto; margin-top: 1; }
+    .switchrow Label { width: 1fr; margin-top: 1; }
+    #err2 { color: $error; height: auto; }
+    #sbtns { height: auto; align-horizontal: right; margin-top: 1; }
+    #sbtns Button { margin-left: 2; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, settings):
+        super().__init__()
+        self.settings = settings
+
+    def compose(self) -> ComposeResult:
+        s = self.settings
+        with Vertical(id="sb"):
+            yield Static("⚙ settings", classes="h")
+            yield Static("global · saved to [settings] in the compose file", classes="sub")
+            with Horizontal(classes="switchrow"):
+                yield Label("desktop notifications (sync failures + blocked syncs)")
+                yield Switch(value=bool(s.get("notify", True)), id="s_notify")
+            yield Label("notify command — portable: notify-send · dunstify · a script")
+            yield Input(value=str(s.get("notify_cmd", "notify-send")), id="s_cmd")
+            yield Label("block a sync that would delete more than N files (0 = off)")
+            yield Input(value=str(s.get("delete_guard", 25)), id="s_guard")
+            yield Static("", id="err2")
+            with Horizontal(id="sbtns"):
+                yield Button("Cancel", id="s_cancel")
+                yield Button("Save", variant="primary", id="s_save")
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#s_cancel")
+    def _cancel(self):
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#s_save")
+    def _save(self):
+        guard = self.query_one("#s_guard", Input).value.strip()
+        if not guard.isdigit():
+            self.query_one("#err2", Static).update("deletion guard must be a whole number (0 = off)")
+            return
+        self.dismiss({
+            "notify": self.query_one("#s_notify", Switch).value,
+            "notify_cmd": self.query_one("#s_cmd", Input).value.strip() or "notify-send",
+            "delete_guard": int(guard),
+        })
+
+
+class ConfirmModal(ModalScreen):
+    CSS = """
+    ConfirmModal { align: center middle; background: $background 65%; }
+    #cb { width: 62; height: auto; padding: 1 2; background: $panel; border: round $warning; }
+    #cb .h { color: $warning; text-style: bold; margin-bottom: 1; }
+    #cbtns { height: auto; align-horizontal: right; margin-top: 1; }
+    #cbtns Button { margin-left: 2; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, title, body, ok_label="Confirm", ok_variant="error"):
+        super().__init__()
+        self.title_text = title
+        self.body_text = body
+        self.ok_label = ok_label
+        self.ok_variant = ok_variant
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="cb"):
+            yield Static(self.title_text, classes="h")
+            yield Static(self.body_text)
+            with Horizontal(id="cbtns"):
+                yield Button("Cancel", id="c_no")
+                yield Button(self.ok_label, variant=self.ok_variant, id="c_yes")
+
+    def action_cancel(self):
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#c_no")
+    def _no(self):
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#c_yes")
+    def _yes(self):
+        self.dismiss(True)
 
 
 # ── app ──────────────────────────────────────────────────────────────────────
@@ -642,7 +817,10 @@ class OsyncDash(App):
         ("d", "cycle_direction", "Direction"),
         ("A", "auto_sync", "Auto-sync"),
         ("a", "add_host", "Add"),
+        ("e", "edit_host", "Edit"),
+        ("x", "delete_host", "Delete"),
         ("l", "log", "Log"),
+        ("comma", "settings", "Settings"),
         ("down,j", "focus_next_card", "Next"),
         ("up,k", "focus_prev_card", "Prev"),
         ("q", "quit", "Quit"),
@@ -657,6 +835,7 @@ class OsyncDash(App):
         self.data = {}                 # name -> (state, local, remote)
         self.pending = {}              # name -> pending dict | None
         self.pending_running = {}      # name -> bool
+        self.auto = {}                 # name -> auto_status dict
         self._spin = 0
         self._load_compose()
 
@@ -716,7 +895,7 @@ class OsyncDash(App):
             return
         card.update(card_body(name, cfg, tgt, self.data.get(name),
                               self.pending.get(name), self.pending_running.get(name, False),
-                              self._spin))
+                              self._spin, self.auto.get(name)))
 
     def _tick(self):
         """Advance the spinner; only re-render cards that are actively working."""
@@ -735,7 +914,11 @@ class OsyncDash(App):
         except Exception as e:  # noqa: BLE001
             self.call_from_thread(self.notify, f"{name}: refresh failed: {e}", severity="error")
             return
-        self.call_from_thread(self._apply, name, data)
+        try:
+            auto = core.auto_status(name)
+        except Exception:  # noqa: BLE001
+            auto = None
+        self.call_from_thread(self._apply, name, data, auto)
 
     @work(thread=True, group="pending", exclusive=False)
     def check_pending(self, name):
@@ -752,8 +935,10 @@ class OsyncDash(App):
         self.pending[name] = p
         self.call_from_thread(self._render_card, name)
 
-    def _apply(self, name, data):
+    def _apply(self, name, data, auto=None):
         self.data[name] = data
+        if auto is not None:
+            self.auto[name] = auto
         self._render_card(name)
 
     # actions -------------------------------------------------------------
@@ -777,6 +962,20 @@ class OsyncDash(App):
         cfg = next((c for n, c, _ in self.conns if n == name), None)
         if not cfg:
             return
+        # deletion guard: if the last dry-run shows more deletions than the
+        # threshold, confirm before propagating them.
+        guard = int(core.parse_settings().get("delete_guard", 0) or 0)
+        dels = core.pending_deletions(self.pending.get(name))
+        if guard and dels > guard:
+            body = (f"This sync would propagate [b]{dels} deletions[/b] "
+                    f"(guard is {guard}).\nDeletions apply to both replicas. Continue?")
+            self.push_screen(
+                ConfirmModal("⚠ large deletion", body, ok_label="Sync anyway"),
+                lambda ok: self._run_sync(name, cfg) if ok else None)
+            return
+        self._run_sync(name, cfg)
+
+    def _run_sync(self, name, cfg):
         with self.suspend():
             os.system("clear")
             print(f"\033[38;2;230;180;80m▶ Running osync — {name}\033[0m\n")
@@ -834,19 +1033,20 @@ class OsyncDash(App):
         if not cfg:
             return
         self.push_screen(
-            AutoSyncModal(name, cfg.get("_auto", "off"), cfg.get("_interval", "15m")),
+            AutoSyncModal(name, cfg.get("_auto", "off"), cfg.get("_interval", "15m"),
+                          cfg.get("_at", "")),
             lambda res: self._apply_auto(name, res))
 
     def _apply_auto(self, name, res):
         if res is None:
             return
-        mode, interval = res
+        mode, interval, calendar = res
         self.notify("configuring auto-sync…", timeout=2)
-        self._do_set_auto(name, mode, interval)
+        self._do_set_auto(name, mode, interval, calendar)
 
     @work(thread=True, group="auto", exclusive=False)
-    def _do_set_auto(self, name, mode, interval):
-        _, msg = core.set_auto(name, mode, interval)
+    def _do_set_auto(self, name, mode, interval, calendar):
+        _, msg = core.set_auto(name, mode, interval, calendar)
         self.call_from_thread(self._after_auto, name, msg)
 
     def _after_auto(self, name, msg):
@@ -863,12 +1063,64 @@ class OsyncDash(App):
     def action_add_host(self):
         self.push_screen(AddHost(core.ts_devices()), self._added)
 
-    def _added(self, name):
+    def action_edit_host(self):
+        name = self._focused_name()
         if not name:
             return
+        _, conns = core.parse_compose()
+        conn = next((c for c in conns if c.get("name") == name), None)
+        if conn:
+            self.push_screen(AddHost(core.ts_devices(), edit=conn), self._added)
+
+    def _added(self, result):
+        if not result:
+            return
+        action, name = result
         self._load_compose()
         self._build_cards()
-        self.notify(f"created connection '{name}'", severity="information")
+        if action == "edit":
+            # regenerate any running auto units against the edited config
+            _, conns = core.parse_compose()
+            conn = next((c for c in conns if c.get("name") == name), None)
+            if conn and core.auto_mode(conn) != "off":
+                self._do_set_auto(name, core.auto_mode(conn), conn.get("interval"), conn.get("at"))
+            self.notify(f"updated '{name}'", severity="information")
+        else:
+            self.notify(f"created connection '{name}'", severity="information")
+
+    def action_delete_host(self):
+        name = self._focused_name()
+        if not name:
+            return
+        body = (f"Delete connection [b]{name}[/b]?\n\nThis removes it from the compose "
+                f"file and stops any auto-sync unit. Your synced files are left untouched.")
+        self.push_screen(ConfirmModal("🗑 delete connection", body, ok_label="Delete"),
+                         lambda ok: self._delete(name) if ok else None)
+
+    @work(thread=True, group="delete", exclusive=False)
+    def _delete(self, name):
+        try:
+            core.remove_connection(name)
+        except Exception as e:  # noqa: BLE001
+            self.call_from_thread(self.notify, f"delete failed: {e}", severity="error")
+            return
+        self.call_from_thread(self._after_delete, name)
+
+    def _after_delete(self, name):
+        for d in (self.data, self.pending, self.pending_running, self.auto):
+            d.pop(name, None)
+        self._load_compose()
+        self._build_cards()
+        self.notify(f"deleted '{name}'", severity="information")
+
+    def action_settings(self):
+        self.push_screen(SettingsModal(core.parse_settings()), self._saved_settings)
+
+    def _saved_settings(self, updates):
+        if updates is None:
+            return
+        core.save_settings(updates)
+        self.notify("settings saved", severity="information")
 
     # helpers -------------------------------------------------------------
     def _triple(self, name):

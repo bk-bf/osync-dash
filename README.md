@@ -111,8 +111,11 @@ In the TUI, actions apply to the **focused card** (move focus with ↑/↓ or `j
 | `s` | run the sync (suspends to stream osync, then returns) |
 | `t` | cycle the endpoint mode (Tailscale / SSH / both) |
 | `d` | cycle the sync direction (bidirectional / send → / receive ←) |
-| `A` | cycle **auto-sync** (off → on-change → periodic) for the focused card |
+| `A` | **auto-sync** picker (off · on-change · periodic — interval or calendar) |
 | `a` | add a connection (floating form, appends to the compose file) |
+| `e` | edit the focused connection (same form, name fixed) |
+| `x` | delete the focused connection (confirms; synced files untouched) |
+| `,` | settings (notifications, deletion guard) |
 | `l` | page the osync log |
 | `q` | quit |
 
@@ -150,16 +153,36 @@ picker; osync-dash writes and manages a **systemd `--user`** unit for it:
 - **on file change** — runs `osync.sh <conf> --on-changes`, osync's inotify
   monitor, as a long-lived service. Syncs shortly after changes settle.
   (Needs `inotify-tools` / `inotifywait`.)
-- **periodic** — a oneshot sync service fired by a `.timer` on the interval you
-  choose: presets from **1 minute to 2 weeks**, or a custom value like `90m`,
-  `6h`, `2d`, `10d`, `1w`. Stored as `interval = "6h"` on the connection.
+- **periodic** — a oneshot sync fired by a `.timer`, either:
+  - **every** a fixed interval: presets **1 minute → 2 weeks** or a custom
+    `90m` / `6h` / `2d` / `1w` (stored as `interval = "6h"`), or
+  - **at** a calendar time: presets (daily 03:00, weekdays 09:00, weekly…) or a
+    custom systemd `OnCalendar` like `Mon..Fri 18:00` (stored as `at = "…"`).
 - **off** — manual only.
 
-Units are named `osync-dash-<name>.{service,timer}` under
-`~/.config/systemd/user/`. They survive logout/reboot **if user lingering is
-on** (`loginctl enable-linger $USER`); otherwise they run only while you're
-logged in. The mode shows on each card under **auto-sync**, and is stored as
-`auto = "change|periodic|off"` in the compose file.
+Each card's **auto-sync** line shows the live unit state — `next in 4m · last
+ok`, or a red `⚠ last run failed` you can jump into with `l`. Units are
+`osync-dash-<name>.{service,timer}` under `~/.config/systemd/user/`, and survive
+logout/reboot when user lingering is on (`loginctl enable-linger $USER`).
+
+**Scheduled and continuous syncs run through the deletion guard** (below), so an
+unattended sync can't quietly mirror a mass-delete.
+
+## Settings & safety net
+
+Press `,` for global settings, stored in `[settings]` of the compose file so
+they travel with your config and stay portable across machines:
+
+- **Desktop notifications** — on/off, plus the **command** to use. Defaults to
+  `notify-send`; point it at `dunstify`, a wrapper script, or anything taking
+  `<cmd> TITLE BODY`. You get a notification when a sync fails or is blocked.
+- **Deletion guard** — `delete_guard = N`: before any sync (manual *or*
+  automatic) osync-dash checks the dry-run, and if it would propagate more than
+  `N` deletions it **blocks and notifies** instead of running. A manual `s`
+  turns this into an "are you sure?" you can override; an automatic run just
+  skips and flags the card. Set `0` to disable. Guards against the classic
+  disaster where an empty or unmounted replica deletes everything on the other
+  side.
 
 ### Non-interactive
 
