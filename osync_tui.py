@@ -122,8 +122,9 @@ def device_line(role, r, accent) -> Group:
     return Group(*rows)
 
 
-def pushpull_line(cfg, state, pending, pending_running, spin) -> Text:
-    """↑push / ↓pull legs — spin while a sync runs, else show queued counts."""
+def pushpull_line(cfg, state, pending, pending_running, spin, pending_ts=None) -> Text:
+    """↑push / ↓pull legs — spin while a sync runs, else show queued counts
+    (with an 'as of' age, since the counts are a dry-run snapshot, not live)."""
     running = state.get("running")
     d = core.direction_of(cfg)
     frame = SPIN[spin % len(SPIN)]
@@ -156,6 +157,9 @@ def pushpull_line(cfg, state, pending, pending_running, spin) -> Text:
     t.append_text(leg(push_active, "↑", "push", push))
     t.append("        ")
     t.append_text(leg(pull_active, "↓", "pull", pull))
+    if not running and pending is not None and pending_ts:
+        age = core.human_age(core.time.time() - pending_ts)
+        t.append(f"    ·  checked {age} ago", style=LINE)
     return t
 
 
@@ -198,7 +202,8 @@ def auto_line(cfg, auto_st) -> Text:
     return t
 
 
-def card_body(name, cfg, tgt, data, pending, pending_running, spin, auto_st=None) -> Group:
+def card_body(name, cfg, tgt, data, pending, pending_running, spin, auto_st=None,
+              pending_ts=None) -> Group:
     if data is None:
         return Group(Text("  gathering…", style=MUTED))
     state, local, remote = data
@@ -231,7 +236,7 @@ def card_body(name, cfg, tgt, data, pending, pending_running, spin, auto_st=None
                  style=MINT if resume in ("0", None) else SALMON)
 
     dev_target = remote if tgt.get("remote") else local
-    parts = [hdr, pushpull_line(cfg, state, pending, pending_running, spin), res_t,
+    parts = [hdr, pushpull_line(cfg, state, pending, pending_running, spin, pending_ts), res_t,
              Text(""), device_line("local", local, MINT),
              device_line("remote", dev_target, GOLD)]
     if tgt.get("remote") and not remote.get("reach", False):
@@ -834,6 +839,7 @@ class OsyncDash(App):
         self.conns = []                # [(name, cfg, tgt)]
         self.data = {}                 # name -> (state, local, remote)
         self.pending = {}              # name -> pending dict | None
+        self.pending_ts = {}           # name -> unix ts of that pending snapshot
         self.pending_running = {}      # name -> bool
         self.auto = {}                 # name -> auto_status dict
         self._spin = 0
@@ -856,6 +862,7 @@ class OsyncDash(App):
         self._build_cards()
         self.set_interval(self.interval, self.action_refresh)
         self.set_interval(0.12, self._tick)
+        self.set_interval(1.5, self._poll_running)  # cheap live sync detection
 
     # cards ---------------------------------------------------------------
     def _build_cards(self):
@@ -895,7 +902,7 @@ class OsyncDash(App):
             return
         card.update(card_body(name, cfg, tgt, self.data.get(name),
                               self.pending.get(name), self.pending_running.get(name, False),
-                              self._spin, self.auto.get(name)))
+                              self._spin, self.auto.get(name), self.pending_ts.get(name)))
 
     def _tick(self):
         """Advance the spinner; only re-render cards that are actively working."""
@@ -918,7 +925,8 @@ class OsyncDash(App):
             auto = core.auto_status(name)
         except Exception:  # noqa: BLE001
             auto = None
-        self.call_from_thread(self._apply, name, data, auto)
+        pend, pts = core.read_pending(cfg["_configfile"])
+        self.call_from_thread(self._apply, name, data, auto, pend, pts)
 
     @work(thread=True, group="pending", exclusive=False)
     def check_pending(self, name):
@@ -935,11 +943,43 @@ class OsyncDash(App):
         self.pending[name] = p
         self.call_from_thread(self._render_card, name)
 
-    def _apply(self, name, data, auto=None):
+    def _apply(self, name, data, auto=None, pend=None, pts=None):
         self.data[name] = data
         if auto is not None:
             self.auto[name] = auto
+        if pend is not None:
+            self.pending[name] = pend
+            self.pending_ts[name] = pts
         self._render_card(name)
+
+    @work(thread=True, group="running", exclusive=True)
+    def _poll_running(self):
+        """Cheap lock-file poll so the ↑push/↓pull spinner catches short syncs
+        the 6 s full refresh would miss. No ssh, no dry-run."""
+        upd = {}
+        for name, cfg, _ in self.conns:
+            sd = os.path.expanduser(cfg.get("INITIATOR_SYNC_DIR", ""))
+            try:
+                upd[name] = core.sync_running(sd)
+            except Exception:  # noqa: BLE001
+                pass
+        if upd:
+            self.call_from_thread(self._apply_running, upd)
+
+    def _apply_running(self, upd):
+        for name, running in upd.items():
+            d = self.data.get(name)
+            if not d or d[0].get("running") == running:
+                continue
+            was = d[0].get("running")
+            d[0]["running"] = running
+            if was and not running:  # a sync just finished — pick up fresh counts
+                cfg = next((c for n, c, _ in self.conns if n == name), None)
+                if cfg:
+                    pend, pts = core.read_pending(cfg["_configfile"])
+                    if pend is not None:
+                        self.pending[name], self.pending_ts[name] = pend, pts
+            self._render_card(name)
 
     # actions -------------------------------------------------------------
     def _focused_name(self):

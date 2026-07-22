@@ -288,6 +288,18 @@ def probe_remote(cfg: dict, tgt: dict) -> dict:
     return d
 
 
+def sync_running(sync_dir: Path) -> bool:
+    """Cheap, local-only 'is a sync in progress?' — osync holds a lock file in
+    the state dir while running. No ssh, no pgrep, so it's fine to poll often
+    (used for the live push/pull spinner)."""
+    sd = Path(sync_dir) / OSYNC_DIR / "state"
+    try:
+        return sd.is_dir() and any(p.name.endswith(".lock") or p.name == "lock"
+                                   for p in sd.iterdir())
+    except OSError:
+        return False
+
+
 def probe_state(cfg: dict, sync_dir: Path) -> dict:
     inst = cfg.get("INSTANCE_ID", "")
     sd = sync_dir / OSYNC_DIR / "state"
@@ -464,6 +476,10 @@ def render(cfg, tgt, state, local, remote, width) -> str:
 
 
 # ── actions ─────────────────────────────────────────────────────────────────
+def _pending_cache(cfg_path) -> Path:
+    return Path(cfg_path).with_suffix(".pending.json")
+
+
 def compute_pending(cfg_path: Path) -> dict | None:
     rc, out = run([OSYNC_BIN, str(cfg_path), "--dry", "--summary", "--no-prefix"], timeout=180)
     def grab(pat):
@@ -475,7 +491,26 @@ def compute_pending(cfg_path: Path) -> dict | None:
     tdl = grab(r"Target has (\d+) deletions")
     if not re.search(r"osync finished", out):
         return None
-    return {"iu": iu, "tu": tu, "id": idl, "td": tdl, "total": iu + tu + idl + tdl}
+    result = {"iu": iu, "tu": tu, "id": idl, "td": tdl, "total": iu + tu + idl + tdl}
+    # cache it beside the conf: the scheduled sync's own dry-run runs here, so
+    # the TUI can show fresh counts without ever running its own dry-run.
+    try:
+        _pending_cache(cfg_path).write_text(json.dumps({**result, "ts": time.time()}))
+    except OSError:
+        pass
+    return result
+
+
+def read_pending(cfg_path) -> tuple[dict | None, float | None]:
+    """Last cached dry-run result + its timestamp, or (None, None)."""
+    p = _pending_cache(cfg_path)
+    if not p.exists():
+        return None, None
+    try:
+        d = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None, None
+    return d, d.get("ts")
 
 
 def pick_config(explicit: str | None) -> Path:
