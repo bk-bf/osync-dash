@@ -215,12 +215,12 @@ def resolve_ssh_host(host: str) -> str | None:
     return None
 
 
-def probe_local(sync_dir: Path) -> dict:
+def probe_local(sync_dir: Path, baseline=None) -> dict:
     d = {"reach": sync_dir.is_dir(), "rsync": bool(shutil.which("rsync")),
          "host": socket.gethostname()}
     if not d["reach"]:
         return d
-    files = size = 0
+    files = size = changed = 0
     for root, dirs, fs in os.walk(sync_dir):
         if OSYNC_DIR in Path(root).parts:
             dirs[:] = [x for x in dirs if x != OSYNC_DIR]
@@ -230,11 +230,17 @@ def probe_local(sync_dir: Path) -> dict:
         for f in fs:
             fp = Path(root) / f
             try:
-                size += fp.stat().st_size
+                stt = fp.stat()
+                size += stt.st_size
                 files += 1
+                # git-style live diff: files touched since the last sync are the
+                # local changes waiting to push (mtime beats the baseline).
+                if baseline is not None and stt.st_mtime > baseline:
+                    changed += 1
             except OSError:
                 pass
     d["files"], d["size"] = files, size
+    d["changed"] = changed if baseline is not None else None
     try:
         st = os.statvfs(sync_dir)
         d["free"] = st.f_bavail * st.f_frsize
@@ -250,6 +256,7 @@ def probe_local(sync_dir: Path) -> dict:
 
 REMOTE_PROBE = r'''
 p=%s
+b=%s
 echo "REACH=1"
 command -v rsync >/dev/null && echo "RSYNC=1" || echo "RSYNC=0"
 echo "HOST=$(hostname 2>/dev/null)"
@@ -259,6 +266,9 @@ if [ -d "$p" ]; then
   df -PB1 "$p" 2>/dev/null | awk 'NR==2{print "DISK_TOTAL="$2"\nDISK_USED="$3"\nFREE="$4}'
   echo "DELETED=$(find "$p/.osync_workdir/deleted" -type f 2>/dev/null | wc -l)"
   echo "BACKUP=$(find "$p/.osync_workdir/backup" -type f 2>/dev/null | wc -l)"
+  if [ -n "$b" ]; then
+    echo "CHANGED=$(find "$p" -type f -not -path '*/.osync_workdir/*' -newermt @"$b" 2>/dev/null | wc -l)"
+  fi
   echo "DIR=1"
 else
   echo "DIR=0"
@@ -266,9 +276,10 @@ fi
 '''
 
 
-def probe_remote(cfg: dict, tgt: dict) -> dict:
+def probe_remote(cfg: dict, tgt: dict, baseline=None) -> dict:
     import shlex
-    script = REMOTE_PROBE % shlex.quote(tgt["path"])
+    script = REMOTE_PROBE % (shlex.quote(tgt["path"]),
+                             shlex.quote(str(int(baseline)) if baseline else ""))
     rc, out = run(ssh_prefix(cfg, tgt) + [script], timeout=20)
     if rc != 0:
         return {"reach": False, "err": out.strip().splitlines()[-1] if out.strip() else "unreachable"}
@@ -279,7 +290,7 @@ def probe_remote(cfg: dict, tgt: dict) -> dict:
         k, _, v = line.partition("=")
         d[k.lower()] = v.strip()
     d["rsync"] = d.get("rsync") == "1"
-    for k in ("files", "size", "free", "deleted", "backup", "disk_total", "disk_used"):
+    for k in ("files", "size", "free", "deleted", "backup", "disk_total", "disk_used", "changed"):
         try:
             d[k] = int(d[k])
         except (KeyError, ValueError):
@@ -476,11 +487,10 @@ def render(cfg, tgt, state, local, remote, width) -> str:
 
 
 # ── actions ─────────────────────────────────────────────────────────────────
-def _pending_cache(cfg_path) -> Path:
-    return Path(cfg_path).with_suffix(".pending.json")
-
-
 def compute_pending(cfg_path: Path) -> dict | None:
+    """Authoritative osync dry-run: exact updates + deletions in each direction.
+    Slower than the live probe counts (a full rsync comparison over ssh), so it's
+    used for the deletion guard and the on-demand exact check, not live display."""
     rc, out = run([OSYNC_BIN, str(cfg_path), "--dry", "--summary", "--no-prefix"], timeout=180)
     def grab(pat):
         m = re.search(pat, out)
@@ -491,26 +501,7 @@ def compute_pending(cfg_path: Path) -> dict | None:
     tdl = grab(r"Target has (\d+) deletions")
     if not re.search(r"osync finished", out):
         return None
-    result = {"iu": iu, "tu": tu, "id": idl, "td": tdl, "total": iu + tu + idl + tdl}
-    # cache it beside the conf: the scheduled sync's own dry-run runs here, so
-    # the TUI can show fresh counts without ever running its own dry-run.
-    try:
-        _pending_cache(cfg_path).write_text(json.dumps({**result, "ts": time.time()}))
-    except OSError:
-        pass
-    return result
-
-
-def read_pending(cfg_path) -> tuple[dict | None, float | None]:
-    """Last cached dry-run result + its timestamp, or (None, None)."""
-    p = _pending_cache(cfg_path)
-    if not p.exists():
-        return None, None
-    try:
-        d = json.loads(p.read_text())
-    except (OSError, ValueError):
-        return None, None
-    return d, d.get("ts")
+    return {"iu": iu, "tu": tu, "id": idl, "td": tdl, "total": iu + tu + idl + tdl}
 
 
 def pick_config(explicit: str | None) -> Path:
@@ -1336,14 +1327,19 @@ def ts_devices() -> list[dict]:
 
 def gather(cfg, tgt, local_only=False):
     sync_dir = Path(os.path.expanduser(cfg.get("INITIATOR_SYNC_DIR", "")))
-    local = probe_local(sync_dir)
+    # baseline = last successful sync time; both replicas were identical then, so
+    # anything with a newer mtime is a live change waiting to sync (git-style).
+    inst = cfg.get("INSTANCE_ID", "")
+    la = sync_dir / OSYNC_DIR / "state" / f"initiator-last-action-{inst}"
+    baseline = la.stat().st_mtime if la.exists() else None
+    local = probe_local(sync_dir, baseline)
     remote = {"reach": False, "err": "skipped"}
     if tgt.get("remote") and not local_only:
         user = tgt.get("user", "")
         path = tgt.get("path", "")
         last = None
         for which, host, port in endpoints(cfg):
-            r = probe_remote(cfg, {**tgt, "host": host, "port": port})
+            r = probe_remote(cfg, {**tgt, "host": host, "port": port}, baseline)
             last = r
             if r.get("reach"):
                 r["endpoint_used"] = which

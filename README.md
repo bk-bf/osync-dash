@@ -25,9 +25,15 @@ gets its own always-expanded card: merged health + sync-state, both machines
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-When a sync is running, the ↑push / ↓pull legs animate a spinner (for the
-direction that's actually moving data); otherwise they show the queued counts
-from the last dry-run. Cards are focusable — actions apply to the focused one.
+When a sync is running, the ↑push / ↓pull legs animate a spinner (detected live
+from osync's lock file). Otherwise they show **live counts of files changed
+since the last sync** — computed the git way: local changes (→ push) come from
+comparing the local tree's mtimes against the last-sync baseline in the same
+walk that already runs; remote changes (→ pull) from a fast `find -newermt` in
+the same ssh probe. No dry-run, refreshed every cycle. These are an mtime-based
+estimate (they don't see deletions or excludes) — press `c` for the exact osync
+dry-run (updates + deletions per direction). Cards are focusable — actions apply
+to the focused one.
 
 ## Architecture
 

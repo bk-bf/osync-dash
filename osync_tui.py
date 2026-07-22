@@ -122,44 +122,44 @@ def device_line(role, r, accent) -> Group:
     return Group(*rows)
 
 
-def pushpull_line(cfg, state, pending, pending_running, spin, pending_ts=None) -> Text:
-    """↑push / ↓pull legs — spin while a sync runs, else show queued counts
-    (with an 'as of' age, since the counts are a dry-run snapshot, not live)."""
+def pushpull_line(cfg, tgt, state, local, remote, spin) -> Text:
+    """↑push / ↓pull legs from the live probe: files changed on each side since
+    the last sync (fast, refreshed every cycle). Spins while a sync is running.
+    These are a mtime-based estimate; press c for the exact osync dry-run."""
     running = state.get("running")
     d = core.direction_of(cfg)
     frame = SPIN[spin % len(SPIN)]
-    push_active = running and d in ("send", "bidir")
-    pull_active = running and d in ("receive", "bidir")
+    dev_remote = remote if tgt.get("remote") else local
+    push_cnt = local.get("changed")            # local changes → push to remote
+    pull_cnt = dev_remote.get("changed")       # remote changes → pull to local
 
-    def leg(active, arrow, label, cnt):
+    def leg(arrow, verb, cnt, relevant, active):
         s = Text()
+        if not relevant:                        # one-way sync: other leg is off
+            s.append(f"{arrow} {verb} ", style=LINE)
+            s.append("off", style=LINE)
+            return s
         if active:
             s.append(f"{frame} ", style=GOLD)
-            s.append(f"{label} ", style=f"bold {GOLD}")
+            s.append(f"{verb} ", style=f"bold {GOLD}")
             s.append("transferring…", style=GOLD)
+            return s
+        hot = bool(cnt)
+        s.append(f"{arrow} ", style=BLUE if hot else MUTED)
+        s.append(f"{verb} ", style=MUTED)
+        if cnt is None:
+            s.append("—", style=LINE)
+        elif hot:
+            s.append(f"{cnt} to {verb}", style=BLUE)
         else:
-            hot = bool(cnt)
-            s.append(f"{arrow} ", style=BLUE if hot else MUTED)
-            s.append(f"{label} ", style=MUTED)
-            if pending_running:
-                s.append("checking…", style=MUTED)
-            elif cnt is None:
-                s.append("—", style=LINE)
-            elif hot:
-                s.append(f"{cnt} queued", style=BLUE)
-            else:
-                s.append("idle", style=MINT)
+            s.append("in sync", style=MINT)
         return s
 
-    push = None if pending is None else pending["tu"] + pending["td"]
-    pull = None if pending is None else pending["iu"] + pending["id"]
+    push_rel, pull_rel = d in ("send", "bidir"), d in ("receive", "bidir")
     t = Text("  ")
-    t.append_text(leg(push_active, "↑", "push", push))
+    t.append_text(leg("↑", "push", push_cnt, push_rel, running and push_rel))
     t.append("        ")
-    t.append_text(leg(pull_active, "↓", "pull", pull))
-    if not running and pending is not None and pending_ts:
-        age = core.human_age(core.time.time() - pending_ts)
-        t.append(f"    ·  checked {age} ago", style=LINE)
+    t.append_text(leg("↓", "pull", pull_cnt, pull_rel, running and pull_rel))
     return t
 
 
@@ -202,8 +202,7 @@ def auto_line(cfg, auto_st) -> Text:
     return t
 
 
-def card_body(name, cfg, tgt, data, pending, pending_running, spin, auto_st=None,
-              pending_ts=None) -> Group:
+def card_body(name, cfg, tgt, data, spin, auto_st=None) -> Group:
     if data is None:
         return Group(Text("  gathering…", style=MUTED))
     state, local, remote = data
@@ -236,7 +235,7 @@ def card_body(name, cfg, tgt, data, pending, pending_running, spin, auto_st=None
                  style=MINT if resume in ("0", None) else SALMON)
 
     dev_target = remote if tgt.get("remote") else local
-    parts = [hdr, pushpull_line(cfg, state, pending, pending_running, spin, pending_ts), res_t,
+    parts = [hdr, pushpull_line(cfg, tgt, state, local, remote, spin), res_t,
              Text(""), device_line("local", local, MINT),
              device_line("remote", dev_target, GOLD)]
     if tgt.get("remote") and not remote.get("reach", False):
@@ -838,9 +837,6 @@ class OsyncDash(App):
         self.want_pending = want_pending
         self.conns = []                # [(name, cfg, tgt)]
         self.data = {}                 # name -> (state, local, remote)
-        self.pending = {}              # name -> pending dict | None
-        self.pending_ts = {}           # name -> unix ts of that pending snapshot
-        self.pending_running = {}      # name -> bool
         self.auto = {}                 # name -> auto_status dict
         self._spin = 0
         self._load_compose()
@@ -882,8 +878,6 @@ class OsyncDash(App):
             first = first or card
         for name, cfg, tgt in self.conns:
             self.refresh_one(name, cfg, tgt)
-            if self.want_pending:
-                self.check_pending(name)
         if first:
             first.focus()
 
@@ -901,16 +895,14 @@ class OsyncDash(App):
         if cfg is None:
             return
         card.update(card_body(name, cfg, tgt, self.data.get(name),
-                              self.pending.get(name), self.pending_running.get(name, False),
-                              self._spin, self.auto.get(name), self.pending_ts.get(name)))
+                              self._spin, self.auto.get(name)))
 
     def _tick(self):
-        """Advance the spinner; only re-render cards that are actively working."""
+        """Advance the spinner; only re-render cards with a sync in progress."""
         self._spin += 1
         for name in list(self.data):
-            busy = self.pending_running.get(name) or \
-                (self.data.get(name) and self.data[name][0].get("running"))
-            if busy:
+            d = self.data.get(name)
+            if d and d[0].get("running"):
                 self._render_card(name)
 
     # workers -------------------------------------------------------------
@@ -925,31 +917,34 @@ class OsyncDash(App):
             auto = core.auto_status(name)
         except Exception:  # noqa: BLE001
             auto = None
-        pend, pts = core.read_pending(cfg["_configfile"])
-        self.call_from_thread(self._apply, name, data, auto, pend, pts)
+        self.call_from_thread(self._apply, name, data, auto)
 
     @work(thread=True, group="pending", exclusive=False)
     def check_pending(self, name):
+        """On-demand authoritative dry-run — the exact osync figure (incl.
+        deletions/excludes the live estimate can't see), shown as a toast."""
         cfg = next((c for n, c, _ in self.conns if n == name), None)
         if cfg is None:
             return
-        self.pending_running[name] = True
-        self.call_from_thread(self._render_card, name)
+        self.call_from_thread(self.notify, f"{name}: exact dry-run…", timeout=2)
         try:
             p = core.compute_pending(cfg["_configfile"])
         except Exception:  # noqa: BLE001
             p = None
-        self.pending_running[name] = False
-        self.pending[name] = p
-        self.call_from_thread(self._render_card, name)
+        if p is None:
+            msg, sev = "dry-run failed (target unreachable?)", "warning"
+        elif p["total"] == 0:
+            msg, sev = "in sync — nothing pending", "information"
+        else:
+            msg = (f"↑ push {p['tu'] + p['td']} (del {p['td']})  ·  "
+                   f"↓ pull {p['iu'] + p['id']} (del {p['id']})")
+            sev = "information"
+        self.call_from_thread(self.notify, f"{name} — {msg}", severity=sev, timeout=6)
 
-    def _apply(self, name, data, auto=None, pend=None, pts=None):
+    def _apply(self, name, data, auto=None):
         self.data[name] = data
         if auto is not None:
             self.auto[name] = auto
-        if pend is not None:
-            self.pending[name] = pend
-            self.pending_ts[name] = pts
         self._render_card(name)
 
     @work(thread=True, group="running", exclusive=True)
@@ -973,13 +968,10 @@ class OsyncDash(App):
                 continue
             was = d[0].get("running")
             d[0]["running"] = running
-            if was and not running:  # a sync just finished — pick up fresh counts
-                cfg = next((c for n, c, _ in self.conns if n == name), None)
-                if cfg:
-                    pend, pts = core.read_pending(cfg["_configfile"])
-                    if pend is not None:
-                        self.pending[name], self.pending_ts[name] = pend, pts
             self._render_card(name)
+            if was and not running:
+                # a sync just finished — re-probe so the live counts settle
+                self.refresh_one(*self._triple(name))
 
     # actions -------------------------------------------------------------
     def _focused_name(self):
@@ -1002,18 +994,32 @@ class OsyncDash(App):
         cfg = next((c for n, c, _ in self.conns if n == name), None)
         if not cfg:
             return
-        # deletion guard: if the last dry-run shows more deletions than the
-        # threshold, confirm before propagating them.
         guard = int(core.parse_settings().get("delete_guard", 0) or 0)
-        dels = core.pending_deletions(self.pending.get(name))
-        if guard and dels > guard:
-            body = (f"This sync would propagate [b]{dels} deletions[/b] "
-                    f"(guard is {guard}).\nDeletions apply to both replicas. Continue?")
-            self.push_screen(
-                ConfirmModal("⚠ large deletion", body, ok_label="Sync anyway"),
-                lambda ok: self._run_sync(name, cfg) if ok else None)
+        if guard <= 0:
+            self._run_sync(name, cfg)
             return
-        self._run_sync(name, cfg)
+        # deletion guard: dry-run first, confirm if it would delete a lot.
+        self.notify("checking changes before sync…", timeout=2)
+        self._guarded_manual_sync(name, cfg, guard)
+
+    @work(thread=True, group="syncguard", exclusive=False)
+    def _guarded_manual_sync(self, name, cfg, guard):
+        try:
+            p = core.compute_pending(cfg["_configfile"])
+        except Exception:  # noqa: BLE001
+            p = None
+        dels = core.pending_deletions(p)
+        if dels > guard:
+            self.call_from_thread(self._confirm_big_delete, name, cfg, dels, guard)
+        else:
+            self.call_from_thread(self._run_sync, name, cfg)
+
+    def _confirm_big_delete(self, name, cfg, dels, guard):
+        body = (f"This sync would propagate [b]{dels} deletions[/b] (guard is {guard}).\n"
+                f"Deletions apply to both replicas. Continue?")
+        self.push_screen(
+            ConfirmModal("⚠ large deletion", body, ok_label="Sync anyway"),
+            lambda ok: self._run_sync(name, cfg) if ok else None)
 
     def _run_sync(self, name, cfg):
         with self.suspend():
@@ -1026,8 +1032,6 @@ class OsyncDash(App):
                 pass
         tgt = next((t for n, _, t in self.conns if n == name), None)
         self.refresh_one(name, cfg, tgt)
-        if self.want_pending:
-            self.check_pending(name)
 
     def action_log(self):
         name = self._focused_name()
@@ -1147,7 +1151,7 @@ class OsyncDash(App):
         self.call_from_thread(self._after_delete, name)
 
     def _after_delete(self, name):
-        for d in (self.data, self.pending, self.pending_running, self.auto):
+        for d in (self.data, self.auto):
             d.pop(name, None)
         self._load_compose()
         self._build_cards()
