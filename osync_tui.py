@@ -20,6 +20,7 @@ from rich.table import Table  # noqa: E402
 from rich.text import Text  # noqa: E402
 from textual import on, work  # noqa: E402
 from textual.app import App, ComposeResult  # noqa: E402
+from textual.binding import Binding  # noqa: E402
 from textual.containers import Horizontal, Vertical, VerticalScroll  # noqa: E402
 from textual.screen import ModalScreen  # noqa: E402
 from textual.theme import Theme  # noqa: E402
@@ -220,11 +221,9 @@ def card_body(name, cfg, tgt, data, spin, auto_st=None) -> Group:
     resume = state.get("resume")
     hdr = Text("  ")
     hdr.append("● ", style=f"bold {c}")
-    hdr.append(st, style=f"bold {c}")
-    if state["running"]:
-        hdr.append(f"  {SPIN[spin % len(SPIN)]} running", style=BLUE)
-    hdr.append(f"    last sync {age} ago", style=MUTED)
-    hdr.append(f"  ({lastrun})", style=LINE)
+    hdr.append(st, style=f"bold {c}")   # health badge already shows RUNNING; the
+    hdr.append(f"    last sync {age} ago", style=MUTED)  # push/pull leg shows the
+    hdr.append(f"  ({lastrun})", style=LINE)             # active direction spinner
 
     res_t = Text("  ")
     res_t.append("result ", style=MUTED)
@@ -825,6 +824,50 @@ class ConfirmModal(ModalScreen):
         self.dismiss(True)
 
 
+# ── help popup ────────────────────────────────────────────────────────────────
+HELP_KEYS = [
+    ("↑ ↓ · j k", "move between cards"),
+    ("r", "refresh all connections"),
+    ("c", "exact dry-run (focused card)"),
+    ("s", "sync now (focused card)"),
+    ("t", "cycle endpoint  (Tailscale / SSH / both)"),
+    ("d", "cycle direction  (push → / pull ← / bidir ⇄)"),
+    ("A", "auto-sync picker  (off / on-change / scheduled)"),
+    ("a", "add a connection"),
+    ("e", "edit focused connection"),
+    ("x", "delete focused connection"),
+    ("l", "page the osync log"),
+    (",", "settings  (notifications, deletion guard)"),
+    ("?", "this help"),
+    ("q", "quit"),
+]
+
+
+class HelpModal(ModalScreen):
+    CSS = """
+    HelpModal { align: center middle; background: $background 55%; }
+    #help { width: 60; height: auto; max-height: 90%; padding: 1 2; background: $panel;
+            border: round $secondary; }
+    #help .h { color: $secondary; text-style: bold; margin-bottom: 1; }
+    #help .hint { color: $foreground-muted; margin-top: 1; }
+    """
+    BINDINGS = [("escape,question_mark,q", "close", "Close")]
+
+    def compose(self) -> ComposeResult:
+        t = Table(box=None, show_header=False, pad_edge=False, padding=(0, 2, 0, 0))
+        t.add_column(style=f"bold {GOLD}", no_wrap=True, justify="right")
+        t.add_column(style=FG)
+        for keys, desc in HELP_KEYS:
+            t.add_row(keys, desc)
+        with Vertical(id="help"):
+            yield Static("⌨  keyboard shortcuts", classes="h")
+            yield Static(t)
+            yield Static("esc · ? · q   close", classes="hint")
+
+    def action_close(self):
+        self.dismiss()
+
+
 # ── app ──────────────────────────────────────────────────────────────────────
 class OsyncDash(App):
     CSS = """
@@ -854,21 +897,23 @@ class OsyncDash(App):
         border: round $accent; border-title-color: $accent;
     }
     """
+    # only ? and q show in the footer; everything else lives in the ? popup
     BINDINGS = [
-        ("r", "refresh", "Refresh"),
-        ("c", "check", "Check"),
-        ("s", "sync", "Sync"),
-        ("t", "cycle_mode", "Endpoint"),
-        ("d", "cycle_direction", "Direction"),
-        ("A", "auto_sync", "Auto-sync"),
-        ("a", "add_host", "Add"),
-        ("e", "edit_host", "Edit"),
-        ("x", "delete_host", "Delete"),
-        ("l", "log", "Log"),
-        ("comma", "settings", "Settings"),
-        ("down,j", "focus_next_card", "Next"),
-        ("up,k", "focus_prev_card", "Prev"),
-        ("q", "quit", "Quit"),
+        Binding("r", "refresh", "Refresh", show=False),
+        Binding("c", "check", "Check", show=False),
+        Binding("s", "sync", "Sync", show=False),
+        Binding("t", "cycle_mode", "Endpoint", show=False),
+        Binding("d", "cycle_direction", "Direction", show=False),
+        Binding("A", "auto_sync", "Auto-sync", show=False),
+        Binding("a", "add_host", "Add", show=False),
+        Binding("e", "edit_host", "Edit", show=False),
+        Binding("x", "delete_host", "Delete", show=False),
+        Binding("l", "log", "Log", show=False),
+        Binding("comma", "settings", "Settings", show=False),
+        Binding("down,j", "focus_next_card", "Next", show=False),
+        Binding("up,k", "focus_prev_card", "Prev", show=False),
+        Binding("question_mark", "help", "Help", key_display="?"),
+        Binding("q", "quit", "Quit"),
     ]
 
     def __init__(self, local_only=False, interval=6, want_pending=True):
@@ -1261,6 +1306,9 @@ class OsyncDash(App):
         self._load_compose()
         self._build_cards()
         self.notify(f"deleted '{name}'", severity="information")
+
+    def action_help(self):
+        self.push_screen(HelpModal())
 
     def action_settings(self):
         self.push_screen(SettingsModal(core.parse_settings()), self._saved_settings)

@@ -148,7 +148,8 @@ desktop). osync-dash materialises a real osync `.conf` per connection into
 `~/.cache/osync/generated/` when it needs to run osync — the compose file stays
 the single source of truth.
 
-In the TUI, actions apply to the **focused card** (move focus with ↑/↓ or `j`/`k`):
+In the TUI, actions apply to the **focused card** (move focus with ↑/↓ or `j`/`k`).
+Press **`?`** in the app for this list (the footer stays minimal — just `?` and `q`):
 
 | key | action |
 |-----|--------|
