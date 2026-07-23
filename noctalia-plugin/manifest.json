@@ -1,0 +1,28 @@
+{
+  "id": "osync-dash",
+  "name": "osync",
+  "version": "0.1.0",
+  "author": "bk-bf",
+  "description": "osync two-way sync health in the bar: merged health per connection, live push/pull change counts, both replicas and the soft-delete safety net.",
+  "repository": "https://github.com/bk-bf/osync-dash",
+  "entryPoints": {
+    "main": "Main.qml",
+    "barWidget": "BarWidget.qml",
+    "panel": "Panel.qml",
+    "settings": "Settings.qml"
+  },
+  "metadata": {
+    "displayMode": "alwaysShow",
+    "iconColor": "none",
+    "textColor": "none",
+    "cpuIntensive": false,
+    "defaultSettings": {
+      "binPath": "~/.local/bin/osync-dash",
+      "intervalMs": 60000,
+      "localOnly": false,
+      "barMetric": "auto",
+      "colorByHealth": true,
+      "terminalCmd": "kitty"
+    }
+  }
+}
