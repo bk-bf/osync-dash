@@ -104,17 +104,22 @@ Three independent loops, so liveness never waits on the expensive probe:
 
 | Loop | Every | Cost |
 |---|---|---|
-| Lock-file stat (is a sync running?) | 1s | ~2ms |
+| Lock-file stat (is a sync running?) | 300ms | ~2ms (0.7% of a core) |
 | Full probe (counts, disk, reachability) | 20s | ~550ms (ssh + tree walk) |
+| Relative-age tick | 1s | none |
 | Spinner animation | 120ms | none |
 
 osync's lock windows are only ~1.5s wide, so a slow poll misses most syncs
-entirely — a 1-minute sync routine would finish between two probes. The 1Hz
-loop stats the `lock_file` path the core reports (`osync-dash --json`), which is
-microseconds, and **a start/stop transition immediately triggers a full probe**
-so the counts are right the moment a sync ends rather than up to an interval
-later. `osync-dash --status` does the same job for scripts, but pays ~90ms of
-Python startup per call, which is too much to run every second forever.
+entirely — a 1-minute sync routine would finish between two probes. The fast
+loop stats the `lock_file` path the core reports (`osync-dash --json`), which
+costs ~2ms, and **a start/stop transition immediately triggers a full probe** so
+the counts are right the moment a sync ends rather than up to an interval later.
+`osync-dash --status` does the same job for scripts, but pays ~90ms of Python
+startup per call.
+
+Relative ages are computed from `last_sync_ts` against the 1s tick, not from the
+payload's `*_age` fields — those are snapshots taken when the probe ran, so
+rendering them makes the label freeze between probes and then jump.
 
 If even 20s is too much — a laptop on battery, a remote that is often asleep —
 turn on **Local only**: it skips the ssh probe entirely, at the cost of pull

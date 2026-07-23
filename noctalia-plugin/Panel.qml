@@ -224,14 +224,14 @@ Item {
                   pointSize: Style.fontSizeS
                 }
                 NText {
-                  text: "    last sync " + (root.svc ? root.svc.fmtAgeSecs(card.modelData.last_sync_age) : "—")
+                  text: "    last sync " + (root.svc ? root.svc.fmtAgeFrom(card.modelData.last_sync_ts) : "—")
                   pointSize: Style.fontSizeXS
                   color: root.cMuted
                 }
                 NText {
                   // only once "N d ago" stops being precise enough — below a
                   // day the wall-clock stamp just repeats the relative age
-                  visible: (card.modelData.last_sync_age || 0) >= 86400
+                  visible: card.modelData.last_sync_ts ? (Date.now() / 1000 - card.modelData.last_sync_ts) >= 86400 : false
                   text: "(" + (card.modelData.last_run_at || "never") + ")"
                   pointSize: Style.fontSizeXXS
                   color: root.cLine

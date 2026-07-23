@@ -44,7 +44,7 @@ Item {
   readonly property var summary: (payload && payload.summary) || null
   readonly property var connections: (payload && payload.connections) || []
 
-  // Liveness from the 1Hz lock-file poll: { name: running }. The full probe is
+  // Liveness from the ~3Hz lock-file poll: { name: running }. The full probe is
   // far too slow to catch a sync that lasts seconds, so this is the source of
   // truth for "is it running right now" and the full payload supplies the rest.
   property var liveRunning: ({})
@@ -197,6 +197,17 @@ Item {
     return Math.floor(t / 86400) + "d ago";
   }
 
+  // Live age from an absolute epoch stamp. The payload's *_age fields are
+  // computed once, when the probe ran, so rendering those makes the label freeze
+  // between probes and then jump. Deriving it from the timestamp against the
+  // 1s tick is what makes it an actual ticking clock, like the TUI's _clock_tick.
+  function fmtAgeFrom(ts) {
+    tick; // dependency: re-evaluate every second
+    if (!ts)
+      return "never";
+    return fmtAgeSecs(Date.now() / 1000 - Number(ts));
+  }
+
   function fmtAgeMs(ms) {
     if (!ms)
       return "never";
@@ -290,7 +301,7 @@ Item {
         lines.push("   syncing…");
       } else {
         var moved = lastRunText(c);
-        lines.push("   " + (moved ? "moved " + moved + "  ·  " : "") + "last sync " + fmtAgeSecs(c.last_sync_age));
+        lines.push("   " + (moved ? "moved " + moved + "  ·  " : "") + "last sync " + fmtAgeFrom(c.last_sync_ts));
       }
     }
     lines.push("updated " + fmtAgeMs(lastOkMs));
@@ -423,8 +434,9 @@ Item {
   }
 
   Timer {
-    // liveness — 1Hz, since osync's lock windows are only ~1.5s wide
-    interval: 1000
+    // liveness — a stat is a rounding error next to what a CPU/RAM widget does
+    // every second, so sample well inside osync's ~1.5s lock window
+    interval: 300
     running: true
     repeat: true
     triggeredOnStart: true
@@ -440,7 +452,8 @@ Item {
   }
 
   Timer {
-    interval: 15000
+    // 1s: drives every relative-age label, same as the TUI's _clock_tick
+    interval: 1000
     running: true
     repeat: true
     onTriggered: root.tick++
