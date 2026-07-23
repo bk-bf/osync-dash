@@ -23,7 +23,7 @@ Item {
   // ── settings ────────────────────────────────────────────────────────────────
   readonly property var cfg: pluginApi ? pluginApi.pluginSettings : ({})
   readonly property string binPath: String((cfg && cfg.binPath) || "osync-dash").trim()
-  readonly property int intervalMs: Math.max(15000, (cfg && cfg.intervalMs) || 60000)
+  readonly property int intervalMs: Math.max(5000, (cfg && cfg.intervalMs) || 20000)
   readonly property bool localOnly: (cfg && cfg.localOnly !== undefined) ? cfg.localOnly : false
   readonly property string barMetric: (cfg && cfg.barMetric) || "auto"
   readonly property bool colorByHealth: (cfg && cfg.colorByHealth !== undefined) ? cfg.colorByHealth : true
@@ -44,6 +44,18 @@ Item {
   readonly property var summary: (payload && payload.summary) || null
   readonly property var connections: (payload && payload.connections) || []
 
+  // Liveness from the 1Hz lock-file poll: { name: running }. The full probe is
+  // far too slow to catch a sync that lasts seconds, so this is the source of
+  // truth for "is it running right now" and the full payload supplies the rest.
+  property var liveRunning: ({})
+
+  function isRunning(c) {
+    if (!c)
+      return false;
+    var v = liveRunning[c.name];
+    return (v === undefined) ? !!c.running : v;
+  }
+
   // Live change counts summed across every connection — what is waiting to move
   // in each direction since the last successful sync.
   readonly property int pushChanges: {
@@ -58,7 +70,13 @@ Item {
       n += Number(connections[i].pull_changes || 0);
     return n;
   }
-  readonly property bool anyRunning: summary !== null && summary.running > 0
+  readonly property bool anyRunning: {
+    for (var i = 0; i < connections.length; i++) {
+      if (isRunning(connections[i]))
+        return true;
+    }
+    return false;
+  }
   readonly property bool anyProblem: summary !== null && summary.problems > 0
 
   // "Offline" is reachability specifically — the tool failing to run, or a
@@ -110,7 +128,7 @@ Item {
       };
     // osync moves one direction at a time, so only a leg with something to
     // move shows "transferring…" — never both for nothing.
-    if (c.running && (cnt === null || cnt === undefined || cnt > 0))
+    if (isRunning(c) && (cnt === null || cnt === undefined || cnt > 0))
       return {
         "text": spinnerFrames2[spinFrame % spinnerFrames2.length] + " " + verb + " transferring…",
         "color": colorGold
@@ -325,6 +343,64 @@ Item {
     }
   }
 
+  // ── liveness poll ───────────────────────────────────────────────────────────
+  // osync's lock windows are only ~1.5s, so catching a sync needs ~1Hz polling.
+  // `osync-dash --status` would be correct but costs ~90ms of Python startup per
+  // call — far too much to run every second forever. Instead we stat the lock
+  // paths the core reported in `lock_file`, which is a couple of milliseconds and
+  // keeps the path layout owned by the core rather than hardcoded here.
+  // A start/stop transition immediately triggers the full probe, so the counts
+  // are right the moment a sync ends instead of up to an interval later.
+  readonly property string lockCmd: {
+    var parts = [];
+    for (var i = 0; i < connections.length; i++) {
+      var c = connections[i];
+      if (!c.lock_file)
+        continue;
+      parts.push('if [ -e "' + c.lock_file + '" ]; then echo "' + c.name + ' 1"; else echo "' + c.name + ' 0"; fi');
+    }
+    return parts.join("; ");
+  }
+
+  Process {
+    id: statusProc
+    command: ["sh", "-c", root.lockCmd]
+
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var s = String(this.text || "").trim();
+        if (s === "")
+          return;
+        var next = {};
+        var changed = false;
+        var lines = s.split("\n");
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i].trim();
+          if (line === "")
+            continue;
+          // "<name> <0|1>" — the name may contain spaces, so split off the flag
+          var cut = line.lastIndexOf(" ");
+          if (cut < 0)
+            continue;
+          var name = line.substring(0, cut);
+          var run = line.substring(cut + 1) === "1";
+          next[name] = run;
+          if (run !== !!root.liveRunning[name])
+            changed = true;
+        }
+        root.liveRunning = next;
+        if (changed)
+          root.refresh(); // a sync just started or ended — get real numbers
+      }
+    }
+    stderr: StdioCollector {}
+  }
+
+  function pollStatus() {
+    if (!statusProc.running && lockCmd !== "")
+      statusProc.running = true;
+  }
+
   function openTui() {
     if (terminalCmd && binPath)
       Quickshell.execDetached(["sh", "-c", terminalCmd + " -e " + binPath]);
@@ -337,9 +413,8 @@ Item {
   }
 
   Timer {
-    // While a sync is in flight, poll fast so the pill tracks it and clears
-    // promptly when it finishes. sync_running() is just a lock-file check, so
-    // this stays cheap even though the full probe does not.
+    // Full probe: ssh + tree walk. Kept slow because liveness no longer depends
+    // on it — statusProc catches starts/stops and forces a refresh on each.
     interval: root.anyRunning ? 3000 : root.intervalMs
     running: true
     repeat: true
@@ -348,7 +423,17 @@ Item {
   }
 
   Timer {
-    interval: 220
+    // liveness — 1Hz, since osync's lock windows are only ~1.5s wide
+    interval: 1000
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.pollStatus()
+  }
+
+  Timer {
+    // spinner animation, matching the TUI's 0.12s tick
+    interval: 120
     running: root.anyRunning
     repeat: true
     onTriggered: root.spinFrame = (root.spinFrame + 1) % root.spinnerFrames.length

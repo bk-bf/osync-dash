@@ -22,7 +22,7 @@ Item {
       return;
     var s = pluginApi.pluginSettings || {};
     s.binPath = binInput.text.trim();
-    s.intervalMs = Math.max(15, intervalSpin.value) * 1000;
+    s.intervalMs = Math.max(5, intervalSpin.value) * 1000;
     s.localOnly = localToggle.checked;
     s.barMetric = metricCombo.currentKey || "auto";
     s.colorByHealth = colorToggle.checked;
@@ -76,12 +76,12 @@ Item {
       id: intervalSpin
       Layout.fillWidth: true
       label: "Probe interval"
-      description: "Each probe walks the local tree and ssh's to the remote, so keep this well above the TUI's 6s."
-      from: 15
-      to: 3600
-      stepSize: 15
+      description: "Full probe (walks the local tree, ssh's to the remote). Liveness is polled separately every 1.5s, so this only governs how often counts and disk usage refresh."
+      from: 5
+      to: 600
+      stepSize: 5
       suffix: " s"
-      value: Math.max(15, Math.round(((root.cfg && root.cfg.intervalMs) || 60000) / 1000))
+      value: Math.max(5, Math.round(((root.cfg && root.cfg.intervalMs) || 20000) / 1000))
     }
 
     NToggle {

@@ -18,7 +18,7 @@
     "cpuIntensive": false,
     "defaultSettings": {
       "binPath": "~/.local/bin/osync-dash",
-      "intervalMs": 60000,
+      "intervalMs": 20000,
       "localOnly": false,
       "barMetric": "auto",
       "colorByHealth": true,

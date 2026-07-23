@@ -12,18 +12,28 @@ log parsing. The same `gather()` / `health()` code that powers the TUI and
    ↑ green = healthy · spins while syncing
      · red = a replica is unreachable
         click ↓
-┌──────────────────────────────────────────┐
-│ ✓ osync      2 connections · updated 8s ⟳↗│
-│ ──────────────────────────────────────── │
-│ ▎documents-remote  ⇄            healthy  │
-│  last sync 3m ago                ↑2  ↓0  │
-│  ● local   my-laptop  350 files · 235M 41%│
-│  ● remote  my-server  350 files · 235M 28%│
-│  ~/docs  →  ubuntu@my-server:/srv/docs   │
-│                                          │
-│ ▎claude-sessions   →             stale   │
-│  last sync 2d ago                ↑7  ↓0  │
-└──────────────────────────────────────────┘
+┌────────────────────────────────────────────┐
+│ ● osync     2 connections · updated 8s ⟳ ↗ │
+│ ┌────────────────────────────────────────┐ │
+│ │ documents_remote  ⇄                    │ │
+│ │ ● HEALTHY    last sync 3m ago          │ │
+│ │ ↑ push in sync      ↓ pull in sync     │ │
+│ │ local synced · remote synced · resume  │ │
+│ │   0 clean · moved ↑2 ↓0                │ │
+│ │                                        │ │
+│ │ ▎ local   my-laptop  ● online  rsync ✓ │ │
+│ │     350 files · 235M  disk ▓▓▓░ 41%    │ │
+│ │ ▎ remote  my-server  ● online  rsync ✓ │ │
+│ │     350 files · 235M  disk ▓▓░░ 28%    │ │
+│ │                                        │ │
+│ │ local      ~/docs                      │ │
+│ │ remote     ubuntu@my-server:/srv/docs  │ │
+│ │ via        Tailscale                   │ │
+│ │ auto-sync  every 1min                  │ │
+│ │ safety     soft-delete on 0/0 30d …    │ │
+│ │ log        ~/.cache/osync/…            │ │
+│ └────────────────────────────────────────┘ │
+└────────────────────────────────────────────┘
 ```
 
 ## Dependency
@@ -73,29 +83,43 @@ The label is configurable:
 | `counts` | `healthy / total` |
 | `changes` | Pending `↑push ↓pull` summed across connections |
 
-While a sync is in flight the widget polls every 3s instead of the usual
-interval, so the pill tracks the run and clears promptly — the liveness check is
-just a lock-file stat, so this stays cheap.
+**Panel** — one card per connection, and it is a one-to-one port of the TUI's
+card (`card_body()` in `osync_tui.py`): same rows, same order, same wording,
+same semantic colours. Health badge and last-sync age; the `↑ push / ↓ pull`
+legs with the TUI's exact logic (`off` for the idle leg of a one-way sync,
+`N files` when hot, `in sync` at zero, braille spinner and `transferring…`
+while running); `local … · remote … · resume … · moved ↑x ↓y`; both replicas
+with online dot, rsync, Tailscale identity, file count, size and disk bar; then
+the `local / remote / via / auto-sync / safety / log` rows.
 
-**Panel** — one card per connection, mirroring the TUI: health stripe and label;
-**what the last run actually moved** (`↑2 ↓0`, with deletions as `(−N)` since
-osync folds them into each direction's total); `synced … · checked …`; the
-mtime-based pending `↑push ↓pull`; both replicas with reachability dot /
-hostname / file count / size / disk percent; soft-delete and backup counts when
-non-zero; and the paths. While a sync runs, a live "syncing now" banner replaces
-the static rows.
+Nothing here is invented — if it is on the card it is in the TUI.
 
 **Read-only by design.** Nothing in the bar or panel can start a sync — a stray
 click must never move files. Syncing stays an explicit action in the TUI, which
 the panel's ↗ button opens.
 
-## Cost
+## Cost and cadence
 
-Every probe walks the local tree and ssh's to the remote, so the default
-interval is 60s (minimum 15s) rather than the TUI's 6s. If that is still too
-much — a laptop on battery, a remote that is often asleep — turn on **Local
-only**: it skips the ssh probe entirely, at the cost of pull counts and remote
-replica state going unknown.
+Three independent loops, so liveness never waits on the expensive probe:
+
+| Loop | Every | Cost |
+|---|---|---|
+| Lock-file stat (is a sync running?) | 1s | ~2ms |
+| Full probe (counts, disk, reachability) | 20s | ~550ms (ssh + tree walk) |
+| Spinner animation | 120ms | none |
+
+osync's lock windows are only ~1.5s wide, so a slow poll misses most syncs
+entirely — a 1-minute sync routine would finish between two probes. The 1Hz
+loop stats the `lock_file` path the core reports (`osync-dash --json`), which is
+microseconds, and **a start/stop transition immediately triggers a full probe**
+so the counts are right the moment a sync ends rather than up to an interval
+later. `osync-dash --status` does the same job for scripts, but pays ~90ms of
+Python startup per call, which is too much to run every second forever.
+
+If even 20s is too much — a laptop on battery, a remote that is often asleep —
+turn on **Local only**: it skips the ssh probe entirely, at the cost of pull
+counts and remote replica state going unknown. Liveness keeps working, since
+the lock file is local.
 
 ## Files
 
