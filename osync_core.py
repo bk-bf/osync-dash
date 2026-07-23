@@ -29,6 +29,8 @@ Options:
         --log           Page the full osync log (less), then exit.
         --local-only    Skip the remote ssh probe (offline / fast).
         --no-color      Disable ANSI colour (--print mode).
+        --status        Liveness only (is a sync running?) as JSON. One lock-file
+                        stat per connection — no ssh, cheap to poll every second.
         --json          Emit every connection as machine-readable JSON on stdout
                         and exit (stable schema; consumed by the Noctalia plugin
                         and other integrations). Nothing else is printed.
@@ -1627,6 +1629,12 @@ def connection_json(name: str, cfg: dict, tgt: dict, local_only: bool) -> dict:
         },
         "log": cfg.get("LOGFILE", "") or "",
         "excludes": cfg.get("RSYNC_EXCLUDE_PATTERN", "").strip(),
+        # osync holds this for the whole run. A long-running consumer can stat it
+        # directly (microseconds) to track liveness at 1Hz instead of re-invoking
+        # --status, which pays Python startup every poll. Exposed here so the path
+        # layout stays owned by the core rather than copied into front-ends.
+        "lock_file": str(Path(os.path.expanduser(cfg.get("INITIATOR_SYNC_DIR", "")))
+                         / OSYNC_DIR / "lock"),
         "local": local,
         "remote": remote,
         "state": {
@@ -1636,6 +1644,23 @@ def connection_json(name: str, cfg: dict, tgt: dict, local_only: bool) -> dict:
             "last_run": state.get("last_run"),
         },
     }
+
+
+def emit_status(conns) -> None:
+    """Liveness only — one lock-file stat per connection. No ssh, no tree walk,
+    no dry-run, so this is cheap enough to poll every second or two. That is what
+    catches syncs shorter than the full --json interval (the same trick the TUI
+    uses in _poll_running)."""
+    out = []
+    for name, cfg, _tgt in conns:
+        sync_dir = Path(os.path.expanduser(cfg.get("INITIATOR_SYNC_DIR", "")))
+        out.append({"name": name, "running": sync_running(sync_dir)})
+    print(json.dumps({
+        "schema": JSON_SCHEMA,
+        "status_only": True,
+        "generated_at": int(time.time()),
+        "connections": out,
+    }))
 
 
 def emit_json(conns, local_only: bool) -> None:
@@ -1669,7 +1694,7 @@ def main():
     args = sys.argv[1:]
     o = {"config": None, "watch": False, "interval": 6, "check": False,
          "sync": False, "log": False, "local_only": False, "fast": False,
-         "print": False, "json": False}
+         "print": False, "json": False, "status": False}
     passthru = []
     i = 0
     while i < len(args):
@@ -1687,6 +1712,8 @@ def main():
             o["print"] = True
         elif a == "--json":
             o["json"] = True
+        elif a == "--status":
+            o["status"] = True
         elif a in ("-i", "--interval"):
             i += 1; o["interval"] = float(args[i])
         elif a in ("-f", "--fast", "--no-check"):
@@ -1720,6 +1747,10 @@ def main():
     if not conns:
         sys.exit(f"osync-dash: no connections. Add one in {COMPOSE_FILE} "
                  f"or launch the TUI and press 'a'.")
+
+    if o["status"]:
+        emit_status(conns)
+        return
 
     if o["json"]:
         emit_json(conns, o["local_only"])
