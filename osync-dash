@@ -13,7 +13,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 argv = sys.argv[1:]
 
 _one_off = {"-p", "--print", "--once", "--sync", "--log", "--guarded-sync",
-            "-h", "--help"}
+            "--json", "-h", "--help"}
 want_tui = (
     not any(a in _one_off for a in argv)
     and sys.stdout.isatty()

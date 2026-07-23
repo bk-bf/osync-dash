@@ -38,16 +38,92 @@ to the focused one.
 ## Architecture
 
 - **`osync_core.py`** — data layer + one-shot renderer. **Standard library only**,
-  runs on the system Python. Powers `--print`, all the probing, and the log parsing.
+  runs on the system Python. Powers `--print`, `--json`, all the probing, and the
+  log parsing.
 - **`osync_tui.py`** — the interactive [Textual](https://textual.textualize.io)
   app. The one third-party dependency, kept in a project virtualenv.
 - **`osync-dash`** — thin launcher: interactive → Textual (venv); otherwise →
   the stdlib one-shot renderer.
 - **`versions.env`** — pinned dependency versions (osync ref + Textual), read by
   `install.sh`. The single place to bump versions.
+- **`noctalia-plugin/`** — optional [Noctalia](https://noctalia.dev) bar widget
+  (see below). Depends on this project; ships with it rather than as its own repo.
 
 So the TUI is a proper app (mouse, resize, background refresh, key bindings),
-while `--print` stays dependency-free for scripts, cron, and non-TTY pipes.
+while `--print` stays dependency-free for scripts, cron, and non-TTY pipes, and
+`--json` feeds the desktop widget — three front-ends over one data layer.
+
+## Machine-readable output (`--json`)
+
+```sh
+osync-dash --json [--local-only]
+```
+
+Emits every connection as one JSON object on stdout and exits — stdlib only, no
+ANSI, nothing else printed. It runs the fast path (the probe, never the `--check`
+dry-run), so it is cheap enough to poll.
+
+```jsonc
+{
+  "schema": 1,
+  "generated_at": 1784773925,
+  "host": "cachyos-x8664",
+  "summary": { "total": 2, "running": 0, "healthy": 2,
+               "problems": 0, "worst": "HEALTHY", "worst_color": "green" },
+  "connections": [
+    {
+      "name": "documents-remote",
+      "direction": "bidir",            // bidir | send | receive
+      "health": "HEALTHY",             // same labels the TUI shows
+      "color": "green",
+      "running": false,
+      "last_sync_ts": 1784689897.0,
+      "last_sync_age": 84028,          // seconds since data last moved
+      "last_check_ts": 1784776515.0,
+      "last_check_age": 272,           // since in-sync-ness was last confirmed
+      "push_changes": 0,               // live ↑ count since the last sync
+      "pull_changes": 0,               // live ↓ count
+      "paths":  { "local": "~/docs", "remote": "ssh://user@host:22//srv/docs" },
+      "local":  { "reach": true, "host": "...", "files": 350, "size": 245020870,
+                  "disk_total": 511793483776, "disk_used": 0, "free": 0,
+                  "deleted": 0, "backup": 0, "ts": { "name": "...", "ip": "..." } },
+      "remote": { "reach": true, "host": "...", "files": 350, "...": "..." },
+      "state":  { "init_action": "synced", "tgt_action": "synced",
+                  "resume": "0", "last_run": { "pushed": 2, "pulled": 0 } }
+    }
+  ]
+}
+```
+
+`summary.worst` is the most-alarming health across all connections, so a status
+indicator can colour itself without re-deriving severity. **The schema is
+additive** — fields get added, never renamed or dropped.
+
+### Synced vs. checked
+
+These are deliberately two different timestamps. A periodic sync runs
+`--guarded-sync`, which dry-runs first and **skips the real osync pass when
+nothing needs moving** — so `last_sync_*` stops advancing while a connection is
+healthy but idle, and only the dry-run state files get touched.
+
+Health is therefore judged on `last_check_*` ("when did we last confirm both
+replicas match"), not `last_sync_*` ("when did data last move"). Judging it on
+the latter would flip every quiet connection to `STALE` after 24 h even though it
+was verified in sync moments earlier.
+
+## Noctalia plugin (optional)
+
+`noctalia-plugin/` is a desktop widget for the [Noctalia](https://noctalia.dev)
+shell that runs `osync-dash --json` and renders sync health in your bar, with a
+click-through panel showing every connection. It reimplements nothing — same
+probing, same health rules.
+
+```sh
+cd noctalia-plugin && ./install.sh
+```
+
+Entirely optional — nothing else in this project depends on it. See
+[`noctalia-plugin/README.md`](noctalia-plugin/README.md).
 
 ## Requirements
 

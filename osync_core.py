@@ -29,6 +29,9 @@ Options:
         --log           Page the full osync log (less), then exit.
         --local-only    Skip the remote ssh probe (offline / fast).
         --no-color      Disable ANSI colour (--print mode).
+        --json          Emit every connection as machine-readable JSON on stdout
+                        and exit (stable schema; consumed by the Noctalia plugin
+                        and other integrations). Nothing else is printed.
     -h, --help          This help.
 """
 from __future__ import annotations
@@ -355,6 +358,17 @@ def probe_state(cfg: dict, sync_dir: Path) -> dict:
     d["init_action"] = _state_text(sd / f"initiator-last-action-{inst}")
     d["tgt_action"] = _state_text(sd / f"target-last-action-{inst}")
     d["resume"] = _state_text(sd / f"resume-count-{inst}")
+    # guarded_sync() — the systemd path — runs a dry-run first and skips the real
+    # osync pass entirely when nothing needs moving, so only the *-dry state files
+    # get touched. The real last-action file therefore stops advancing exactly
+    # while a connection is healthy and idle; judging staleness by it alone rots
+    # every quiet connection into STALE after STALE_AFTER. The dry-run timestamp
+    # is proof the pair was *verified* in sync, so track the two separately:
+    #   last_ts       — data last actually moved
+    #   last_check_ts — in-sync-ness last confirmed (what staleness must use)
+    d["last_dry_ts"] = _state_mtime(sd / f"initiator-last-action-{inst}-dry")
+    _stamps = [t for t in (d["last_ts"], d["last_dry_ts"]) if t]
+    d["last_check_ts"] = max(_stamps) if _stamps else None
     # running? lock file (fast) or a live osync process for this config
     d["running"] = sync_running(sync_dir)
     rc2, out = run(["pgrep", "-fa", "osync.sh"], timeout=5)
@@ -383,7 +397,11 @@ def health(state: dict, remote: dict, local: dict) -> tuple[str, str]:
            or (state.get("resume") not in (None, "0", "")))
     if bad:
         return "ERROR", "red"
-    if time.time() - state["last_ts"] > STALE_AFTER:
+    # Stale means "nobody has confirmed these replicas match in a long time",
+    # not "no data has moved in a long time" — an idle pair that was verified
+    # in sync minutes ago is the opposite of stale. See probe_state().
+    checked = state.get("last_check_ts") or state["last_ts"]
+    if time.time() - checked > STALE_AFTER:
         return "STALE", "yellow"
     return "HEALTHY", "green"
 
@@ -1536,11 +1554,122 @@ def gather(cfg, tgt, local_only=False):
 
 
 
+# ── machine-readable output ───────────────────────────────────────────────────
+# --json is a parallel codepath layered on the same gather()/health() the TUI and
+# --print already use: no probing logic is duplicated, no ANSI is emitted. It is
+# the stable dependency contract the Noctalia bar plugin (noctalia-plugin/) reads,
+# so keep the schema additive — add fields, don't rename or drop them.
+JSON_SCHEMA = 1
+
+
+def _truthy(v) -> bool:
+    """Normalize a probe flag to a real bool. probe_remote() parses its ssh
+    output into strings, so `reach` arrives as "1" there but as a bool locally;
+    the JSON schema promises a bool for both."""
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() not in ("", "0", "false", "none")
+
+
+def connection_json(name: str, cfg: dict, tgt: dict, local_only: bool) -> dict:
+    """One connection's full state as a JSON-serializable dict."""
+    state, local, remote = gather(cfg, tgt, local_only)
+    label, color = health(state, remote, local)
+    last_ts = state.get("last_ts")
+    check_ts = state.get("last_check_ts")
+    # copy before normalizing so the shared probe dicts stay untouched
+    local = {**local, "reach": _truthy(local.get("reach"))}
+    remote = {**remote, "reach": _truthy(remote.get("reach"))}
+    return {
+        "name": name,
+        "instance": cfg.get("INSTANCE_ID", name),
+        "direction": direction_of(cfg),          # bidir | push | pull
+        "mode": mode_of(cfg),
+        "health": label,                          # HEALTHY | RUNNING | STALE | ERROR | …
+        "color": color,                           # green | blue | yellow | red | grey
+        "running": bool(state.get("running")),
+        "last_sync_ts": last_ts,
+        "last_sync_age": (int(time.time() - last_ts) if last_ts else None),
+        # when in-sync-ness was last confirmed (dry-run counts) — this, not
+        # last_sync_*, is what staleness is judged on
+        "last_check_ts": check_ts,
+        "last_check_age": (int(time.time() - check_ts) if check_ts else None),
+        # live git-style change counts since the last sync (README: ↑push / ↓pull)
+        "push_changes": local.get("changed"),     # local files newer than baseline
+        "pull_changes": remote.get("changed"),    # remote files newer than baseline
+        "paths": {
+            "local": cfg.get("INITIATOR_SYNC_DIR", ""),
+            "remote": cfg.get("TARGET_SYNC_DIR", "") if tgt.get("remote") else "",
+            # user@host:path, the form the TUI card shows
+            "remote_display": (f"{tgt.get('user', '')}@{tgt.get('host', '')}:{tgt.get('path', '?')}"
+                               if tgt.get("remote") else cfg.get("TARGET_SYNC_DIR", "?")),
+        },
+        # last successful run as a wall-clock stamp, matching the TUI's "(…)"
+        "last_run_at": (time.strftime("%Y-%m-%d %H:%M", time.localtime(last_ts))
+                        if last_ts else "never"),
+        # everything below is config the TUI card renders; exposed so a front-end
+        # can reproduce that card without re-reading the compose/.conf files.
+        "via": {
+            "mode": mode_of(cfg),                      # ts | ssh | both | ""
+            "endpoint_used": remote.get("endpoint_used"),
+        },
+        "auto": {
+            "mode": cfg.get("_auto", "off"),           # off | change | periodic
+            "interval": cfg.get("_interval", ""),
+            "at": cfg.get("_at", ""),
+        },
+        "safety": {
+            "soft_delete": cfg.get("SOFT_DELETE", "true") == "true",
+            "soft_delete_days": cfg.get("SOFT_DELETE_DAYS", ""),
+            "conflict_backup": cfg.get("CONFLICT_BACKUP", "true") == "true",
+            "conflict_backup_days": cfg.get("CONFLICT_BACKUP_DAYS", ""),
+            "winner": "newest",
+        },
+        "log": cfg.get("LOGFILE", "") or "",
+        "excludes": cfg.get("RSYNC_EXCLUDE_PATTERN", "").strip(),
+        "local": local,
+        "remote": remote,
+        "state": {
+            "init_action": state.get("init_action"),
+            "tgt_action": state.get("tgt_action"),
+            "resume": state.get("resume"),
+            "last_run": state.get("last_run"),
+        },
+    }
+
+
+def emit_json(conns, local_only: bool) -> None:
+    """Print the whole dashboard as one JSON object; nothing else on stdout."""
+    connections = [connection_json(name, cfg, tgt, local_only)
+                   for name, cfg, tgt in conns]
+    # worst-first health ranking so a bar widget can colour the whole pill by the
+    # single most-alarming connection without re-deriving severity.
+    rank = {"ERROR": 5, "NO LOCAL DIR": 5, "TARGET UNREACHABLE": 4,
+            "STALE": 3, "NEVER RUN": 2, "RUNNING": 1, "HEALTHY": 0}
+    worst = max(connections, key=lambda c: rank.get(c["health"], 0), default=None)
+    summary = {
+        "total": len(connections),
+        "running": sum(1 for c in connections if c["running"]),
+        "healthy": sum(1 for c in connections if c["health"] == "HEALTHY"),
+        "problems": sum(1 for c in connections
+                        if rank.get(c["health"], 0) >= 3),
+        "worst": worst["health"] if worst else None,
+        "worst_color": worst["color"] if worst else "grey",
+    }
+    print(json.dumps({
+        "schema": JSON_SCHEMA,
+        "generated_at": int(time.time()),
+        "host": socket.gethostname(),
+        "summary": summary,
+        "connections": connections,
+    }))
+
+
 def main():
     args = sys.argv[1:]
     o = {"config": None, "watch": False, "interval": 6, "check": False,
          "sync": False, "log": False, "local_only": False, "fast": False,
-         "print": False}
+         "print": False, "json": False}
     passthru = []
     i = 0
     while i < len(args):
@@ -1556,6 +1685,8 @@ def main():
             o["watch"] = True
         elif a in ("-p", "--print", "--once"):
             o["print"] = True
+        elif a == "--json":
+            o["json"] = True
         elif a in ("-i", "--interval"):
             i += 1; o["interval"] = float(args[i])
         elif a in ("-f", "--fast", "--no-check"):
@@ -1589,6 +1720,10 @@ def main():
     if not conns:
         sys.exit(f"osync-dash: no connections. Add one in {COMPOSE_FILE} "
                  f"or launch the TUI and press 'a'.")
+
+    if o["json"]:
+        emit_json(conns, o["local_only"])
+        return
 
     def one_shot(cfg, tgt, pending=False):
         state, local, remote = gather(cfg, tgt, o["local_only"])
