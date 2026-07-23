@@ -155,7 +155,8 @@ def pushpull_line(cfg, tgt, state, local, remote, spin) -> Text:
         if cnt is None:
             s.append("—", style=LINE)
         elif hot:
-            s.append(f"{cnt} to {verb}", style=BLUE)
+            # the verb is already printed above — "1 to push" said it twice
+            s.append(f"{cnt} file{'' if cnt == 1 else 's'}", style=BLUE)
         else:
             s.append("in sync", style=MINT)
         return s
@@ -223,10 +224,15 @@ def card_body(name, cfg, tgt, data, spin, auto_st=None) -> Group:
     hdr.append("● ", style=f"bold {c}")
     hdr.append(st, style=f"bold {c}")   # health badge already shows RUNNING; the
     hdr.append(f"    last sync {age} ago", style=MUTED)  # push/pull leg shows the
-    hdr.append(f"  ({lastrun})", style=LINE)             # active direction spinner
+    # the wall-clock stamp only earns its place once "N d ago" stops being
+    # precise enough — below a day it just repeats the relative age
+    if state["last_ts"] and (core.time.time() - state["last_ts"]) >= 86400:
+        hdr.append(f"  ({lastrun})", style=LINE)         # active direction spinner
 
     res_t = Text("  ")
-    res_t.append("result ", style=MUTED)
+    # "local"/"remote", not "result"/"remote" — these are the two sides' last
+    # actions, and the rest of the card already speaks in local/remote
+    res_t.append("local ", style=MUTED)
     res_t.append(res, style=rc)
     res_t.append("  ·  remote ", style=MUTED)
     res_t.append(_n(ta), style=MINT if ta == "synced" else MUTED)
