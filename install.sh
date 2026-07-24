@@ -216,6 +216,14 @@ migrate_from_osync_dash
 
 vendor_osync
 
+# A venv hard-codes absolute paths, so one that was moved (or whose system
+# python was replaced) is dead weight — rebuild rather than install into it.
+# The test has to run a *script*: bin/python survives a move (it is a symlink to
+# the system interpreter) while every entry point keeps the old absolute shebang.
+if [ -d "$SRC/.venv" ] && ! "$SRC/.venv/bin/pip" --version >/dev/null 2>&1; then
+  say "existing .venv is stale (moved or broken) — rebuilding"
+  rm -rf "$SRC/.venv"
+fi
 say "creating virtualenv (.venv) for the Textual TUI"
 python3 -m venv "$SRC/.venv"
 "$SRC/.venv/bin/pip" install --quiet --upgrade pip
@@ -231,6 +239,6 @@ echo
 echo "done. Ensure $BIN is on your PATH, then run:"
 echo "    osd                        # the TUI"
 echo "    osd --print                # one-shot render"
-echo "    yeet FILE / yeet                  # one-shot drops across the tailnet"
+echo "    yeet FILE  /  yeet         # one-shot drops across the mesh"
 echo "    $SRC/install.sh --remote user@host  # match osync on a replica"
 echo "    $SRC/install.sh --uninstall         # remove everything"

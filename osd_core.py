@@ -1069,9 +1069,10 @@ def self_update() -> int:
             f"osync-dash/main/install.sh | bash\n")
         return 1
 
-    print(f"{DIM}updating {src}{RESET}")
+    print(f"{DIM}updating {src}{RESET}", flush=True)
     rc, out = run(["git", "-C", str(src), "pull", "--ff-only"], timeout=120)
     sys.stdout.write(out)
+    sys.stdout.flush()  # the installer streams straight to the terminal
     if rc != 0:
         sys.stderr.write("osd: git pull failed — resolve it by hand, "
                          "then run osd -U again\n")
