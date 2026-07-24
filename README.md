@@ -334,7 +334,6 @@ its own delta transfer, `--partial` resume and progress meter.
 | `-a`, `--all` | receive every waiting drop, not just the newest |
 | `-n NAME` | receive the drop whose name contains `NAME` |
 | `-k`, `--keep` | receive without clearing it — fan the same drop out to several machines |
-| `-m`, `--mine` | include drops sent from this machine (skipped by default) |
 | `-f`, `--force` | overwrite existing files in the target directory |
 | `--rm [NAME]` | delete a waiting drop without receiving it (`--all` for every) |
 | `--hub HOST` | set the hub host |
@@ -343,11 +342,29 @@ The hub is stored as `yeet_hub` in `[settings]` of the compose file, and is
 guessed on first use from the host your existing connections already talk to.
 On the hub itself the spool is a plain local directory — no ssh round trip.
 
-Two safety rules: a drop is only visible once its manifest lands, so a
-half-finished upload can never be picked up; and a receive **refuses** rather
-than overwriting a file that already exists in the target directory (`-f`
-overrides). Your own drops are skipped by default so `yeet file` followed by
-`yeet` somewhere else on the same machine can't quietly re-download itself.
+### Interrupted transfers resume
+
+Nothing is thrown away when a transfer dies. **Uploads** are announced before the
+payload moves and stay marked unfinished until it is all there, so a drop in
+flight is visible but cannot be picked up:
+
+```
+$ yeet -l
+  linux.iso  4.4G · 1 file  ← laptop  2m ago   ⋯ uploading 38%
+```
+
+Sending the same paths again **resumes that drop** rather than starting a second
+one — rsync only moves what is missing. Abandoned uploads are binned after a
+week, or immediately with `yeet --rm`.
+
+**Downloads** resume the same way. In-flight chunks are parked in a `.yeet-part`
+directory instead of landing in the destination truncated, so an interrupted
+`yeet` never leaves something that looks like a finished file, and re-running it
+picks up where it stopped. The drop stays on the hub until the transfer actually
+completes.
+
+A receive also **refuses** rather than overwriting a file that already exists in
+the target directory — `-f` overrides.
 
 ## Auto-sync (off · on-change · periodic)
 

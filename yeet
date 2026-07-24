@@ -25,6 +25,8 @@ import osync_core as oc  # noqa: E402
 from osync_core import BOLD, CYAN, DIM, GREEN, GREY, RED, RESET, YELLOW  # noqa: E402
 
 SPOOL = ".local/share/yeet/spool"  # under the hub user's home
+PART = ".yeet-part"                # rsync parks in-flight chunks here
+STALE_UPLOAD = 7 * 86400           # abandoned uploads are binned after this
 USAGE = f"""{BOLD}yeet{RESET} — park a file on the tailnet, pick it up anywhere
 
   {BOLD}yeet{RESET} PATH...        park files/dirs on the hub
@@ -34,7 +36,6 @@ USAGE = f"""{BOLD}yeet{RESET} — park a file on the tailnet, pick it up anywher
   -a, --all           receive every waiting drop, not just the newest
   -n, --name NAME     receive the drop whose name contains NAME
   -k, --keep          receive without clearing it from the hub (fan out)
-  -m, --mine          include drops sent from this machine (skipped by default)
   -f, --force         overwrite existing files in the target dir
       --rm [NAME]     delete a waiting drop without receiving it (--all for every)
       --hub HOST      set the hub host (stored in the osync-dash compose)
@@ -176,6 +177,21 @@ def measure(paths: list[Path]) -> tuple[int, int]:
     return files, total
 
 
+def write_manifest(hub: dict, drop: str, body: dict) -> tuple[int, str]:
+    return hub_run(hub, "cat > " + shlex.quote(f"{SPOOL}/{drop}/manifest.json"),
+                   stdin=json.dumps(body))
+
+
+def sweep_stale(hub: dict, drops: list[dict], me: str, skip: str | None):
+    """Bin this node's own abandoned uploads once they are a week old."""
+    now = int(time.time())
+    dead = [d["id"] for d in drops
+            if d.get("from") == me and d.get("state") != "ready"
+            and d["id"] != skip and now - int(d.get("created", now)) > STALE_UPLOAD]
+    if dead:
+        hub_run(hub, "; ".join("rm -rf " + shlex.quote(f"{SPOOL}/{i}") for i in dead))
+
+
 def send(raw: list[str], hub: dict):
     paths = [Path(p).expanduser().resolve() for p in raw]
     for p in paths:
@@ -183,33 +199,52 @@ def send(raw: list[str], hub: dict):
             die(f"no such file or directory: {p}")
     names = [p.name for p in paths]
     files, total = measure(paths)
+    me = this_node()
 
-    drop = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.urandom(2).hex()}"
+    # An upload that died half-way is still on the hub, marked unfinished. Sending
+    # the same paths again picks up where it stopped instead of starting over.
+    drops = fetch_drops(hub)
+    resume = next((d for d in reversed(drops)
+                   if d.get("from") == me and d.get("state") != "ready"
+                   and set(d.get("paths") or []) == {str(p) for p in paths}), None)
+    drop = resume["id"] if resume else f"{time.strftime('%Y%m%d-%H%M%S')}-{os.urandom(2).hex()}"
+    sweep_stale(hub, drops, me, skip=drop)
+
     remote = f"{SPOOL}/{drop}"
     rc, out = hub_run(hub, f"mkdir -p {shlex.quote(remote)}/payload")
     if rc != 0:
         die(f"cannot reach the hub ({hub_addr(hub)}): {out.strip() or 'ssh failed'}")
 
+    # Manifest first, marked unfinished: the drop is visible as an upload in
+    # progress, but no one can pick it up until the payload is all there.
+    manifest = {"id": drop, "from": me, "created": int(resume["created"]) if resume
+                else int(time.time()), "items": names, "paths": [str(p) for p in paths],
+                "bytes": total, "files": files, "state": "uploading"}
+    rc, out = write_manifest(hub, drop, manifest)
+    if rc != 0:
+        die(f"cannot write to the hub: {out.strip() or 'ssh failed'}")
+
     label = names[0] if len(names) == 1 else f"{len(names)} items"
     print(f"{DIM}→{RESET} {BOLD}{label}{RESET} {GREY}{oc.humansize(total)}"
-          f"{'' if files == 1 else f' · {files} files'} → {hub['host']}{RESET}",
-          flush=True)
+          f"{'' if files == 1 else f' · {files} files'} → {hub['host']}"
+          f"{'  (resuming)' if resume else ''}{RESET}", flush=True)
 
-    cmd = (["rsync", "-aH", "--partial", "--info=progress2"]
+    cmd = (["rsync", "-aH", "--partial", f"--partial-dir=../{PART}",
+            "--info=progress2"]
            + rsync_transport(hub) + [str(p) for p in paths]
            + [spool_path(hub, f"{remote}/payload/")])
     if subprocess.run(cmd).returncode != 0:
-        hub_run(hub, f"rm -rf {shlex.quote(remote)}")
-        die("upload failed — nothing was parked")
+        die(f"upload interrupted — what got through is held on the hub; run the "
+            f"same {BOLD}yeet{RESET} again to finish it, or "
+            f"{BOLD}yeet --rm {drop}{RESET} to bin it")
 
-    # Manifest last: until it exists the drop is invisible, so a half-finished
-    # upload can never be picked up.
-    manifest = json.dumps({"id": drop, "from": this_node(), "created": int(time.time()),
-                           "items": names, "bytes": total, "files": files})
-    rc, out = hub_run(hub, f"cat > {shlex.quote(remote)}/manifest.json", stdin=manifest)
+    manifest["state"] = "ready"
+    manifest["bytes"], manifest["files"] = total, files
+    rc, out = write_manifest(hub, drop, manifest)
     if rc != 0:
-        hub_run(hub, f"rm -rf {shlex.quote(remote)}")
-        die(f"could not finalise the drop: {out.strip()}")
+        die(f"payload is up but the drop could not be finalised: {out.strip()}\n"
+            f"       run the same yeet again to retry")
+    hub_run(hub, "rm -rf " + shlex.quote(f"{remote}/{PART}"))
 
     print(f"{GREEN}✓{RESET} parked as {BOLD}{drop}{RESET} — run {BOLD}yeet{RESET} "
           f"anywhere in the tailnet to pick it up")
@@ -217,23 +252,27 @@ def send(raw: list[str], hub: dict):
 
 # ── receive ─────────────────────────────────────────────────────────────────
 def fetch_drops(hub: dict) -> list[dict]:
-    # `exit 0` because an empty spool leaves the glob unexpanded and the loop
-    # failing — that is "nothing waiting", not an unreachable hub.
+    # Each line is "<bytes on hub>\t<manifest>", so an unfinished upload can be
+    # reported as a percentage. `exit 0` because an empty spool leaves the glob
+    # unexpanded and the loop failing — that is "nothing waiting", not a dead hub.
     rc, out = hub_run(hub,
                       f'for m in ~/{SPOOL}/*/manifest.json; do '
-                      f'[ -f "$m" ] && cat "$m" && echo; done; exit 0')
+                      f'[ -f "$m" ] || continue; '
+                      f'printf "%s\\t" "$(du -sb "$(dirname "$m")" '
+                      f'2>/dev/null | cut -f1)"; cat "$m"; echo; done; exit 0')
     if rc != 0:
         die(f"cannot reach the hub ({hub_addr(hub)}): {out.strip() or 'ssh failed'}")
     drops = []
     for line in out.splitlines():
-        line = line.strip()
-        if not line:
+        size, _, blob = line.partition("\t")
+        if not blob.strip():
             continue
         try:
-            d = json.loads(line)
+            d = json.loads(blob)
         except json.JSONDecodeError:
             continue
         if d.get("id"):
+            d["on_hub"] = int(size) if size.strip().isdigit() else 0
             drops.append(d)
     return sorted(drops, key=lambda d: d.get("created", 0))
 
@@ -245,13 +284,19 @@ def describe(d: dict, me: str) -> str:
     who = d.get("from", "?")
     tag = f" {DIM}(yours){RESET}" if who == me else ""
     age = oc.human_age(max(0, int(time.time()) - int(d.get("created", 0))))
+    state = ""
+    if d.get("state") != "ready":
+        total = int(d.get("bytes") or 0)
+        pct = f" {100 * d.get('on_hub', 0) // total}%" if total else ""
+        state = f"  {YELLOW}⋯ uploading{pct}{RESET}"
     return (f"{BOLD}{label}{RESET}{tag}  {GREY}{oc.humansize(d.get('bytes', 0))}"
-            f"{'' if files == 1 else f' · {files} files'}  ← {who}  {age} ago{RESET}")
+            f"{'' if files == 1 else f' · {files} files'}  ← {who}  {age} ago{RESET}"
+            f"{state}")
 
 
 def select(drops: list[dict], me: str, name: str | None, want_all: bool,
-           mine: bool) -> list[dict]:
-    pool = [d for d in drops if mine or d.get("from") != me]
+           ready_only: bool = True) -> list[dict]:
+    pool = [d for d in drops if d.get("state") == "ready"] if ready_only else list(drops)
     if name:
         pool = [d for d in pool
                 if name.lower() in d["id"].lower()
@@ -259,17 +304,15 @@ def select(drops: list[dict], me: str, name: str | None, want_all: bool,
         if not pool:
             die(f"nothing waiting matches '{name}'")
     if not pool:
-        if drops:
-            die("nothing waiting for this machine (only your own drops — "
-                "use -m to take one anyway)")
+        if any(d.get("state") != "ready" for d in drops):
+            die("nothing ready yet — an upload is still in flight (yeet -l)")
         die("nothing waiting on the hub")
     return pool if want_all else [pool[-1]]
 
 
-def receive(hub: dict, name: str | None, want_all: bool, keep: bool,
-            mine: bool, force: bool):
+def receive(hub: dict, name: str | None, want_all: bool, keep: bool, force: bool):
     me = this_node()
-    picked = select(fetch_drops(hub), me, name, want_all, mine)
+    picked = select(fetch_drops(hub), me, name, want_all)
     dest = Path.cwd()
 
     if not force:
@@ -280,11 +323,19 @@ def receive(hub: dict, name: str | None, want_all: bool, keep: bool,
 
     for d in picked:
         print(f"{DIM}←{RESET} {describe(d, me)}", flush=True)
-        cmd = (["rsync", "-aH", "--partial", "--info=progress2"]
+        # Partial files park in .yeet-part rather than landing in the destination
+        # truncated, so an interrupted download resumes and never looks finished.
+        cmd = (["rsync", "-aH", "--partial", f"--partial-dir={PART}",
+                f"--exclude=/{PART}/", "--info=progress2"]
                + rsync_transport(hub)
                + [spool_path(hub, f'{SPOOL}/{d["id"]}/payload/'), str(dest) + "/"])
         if subprocess.run(cmd).returncode != 0:
-            die(f"download failed — {d['id']} is still on the hub")
+            die(f"download interrupted — {d['id']} is still on the hub; "
+                f"run {BOLD}yeet{RESET} again to resume it")
+        try:
+            (dest / PART).rmdir()
+        except OSError:
+            pass
         if not keep:
             hub_run(hub, "rm -rf " + shlex.quote(f"{SPOOL}/{d['id']}"))
         for i in d.get("items") or []:
@@ -305,7 +356,7 @@ def remove(hub: dict, name: str | None, want_all: bool):
     drops = fetch_drops(hub)
     if not drops:
         die("nothing waiting on the hub")
-    picked = select(drops, this_node(), name, want_all, mine=True)
+    picked = select(drops, this_node(), name, want_all, ready_only=False)
     for d in picked:
         hub_run(hub, "rm -rf " + shlex.quote(f"{SPOOL}/{d['id']}"))
         items = d.get("items") or ["?"]
@@ -317,7 +368,7 @@ def remove(hub: dict, name: str | None, want_all: bool):
 def main():
     argv = sys.argv[1:]
     paths, name = [], None
-    want_all = keep = mine = force = do_list = do_rm = False
+    want_all = keep = force = do_list = do_rm = False
 
     i = 0
     while i < len(argv):
@@ -331,8 +382,6 @@ def main():
             want_all = True
         elif a in ("-k", "--keep"):
             keep = True
-        elif a in ("-m", "--mine"):
-            mine = True
         elif a in ("-f", "--force"):
             force = True
         elif a == "--rm":
@@ -363,7 +412,7 @@ def main():
     elif paths:
         send(paths, hub)
     else:
-        receive(hub, name, want_all, keep, mine, force)
+        receive(hub, name, want_all, keep, force)
 
 
 if __name__ == "__main__":
