@@ -6,7 +6,7 @@ two-way sync jobs, built with [Textual](https://github.com/Textualize/textual).
 gets its own always-expanded card: merged health + sync-state, both machines
 (local + remote over SSH, with hostnames and Tailscale identity), live
 ↑push/↓pull activity, paths, and the soft-delete/backup safety net. Ships with
-[`yeet`](#yeet--one-shot-drops-across-the-tailnet) for one-shot file drops
+[`yeet`](#bonus-yeet--one-shot-drops-across-the-mesh) for one-shot file drops
 between the same machines.
 
 ```
@@ -133,8 +133,8 @@ Entirely optional — nothing else in this project depends on it. See
 
 - Python 3.11+ (uses stdlib `tomllib`)
 - `git`, `rsync`, `ssh` (git only for install; rsync/ssh are osync's own deps)
-- Optional: `tailscale` (device names + import dropdown), `inotify-tools` (for
-  on-change auto-sync)
+- Optional: `tailscale` (device names + import dropdown; not required by
+  [`yeet`](#transport)), `inotify-tools` (for on-change auto-sync)
 
 You do **not** need to install osync yourself — the installer vendors a pinned
 build (see below).
@@ -152,7 +152,8 @@ The installer:
 1. fetches osync-dash into `~/.local/share/osync-dash/`,
 2. **vendors the pinned osync** (`versions.env`) into `…/osync/osync.sh`,
 3. creates the Textual `.venv` with the pinned Textual,
-4. symlinks `osync-dash` into `~/.local/bin`.
+4. symlinks `osync-dash` and [`yeet`](#bonus-yeet--one-shot-drops-across-the-mesh)
+   into `~/.local/bin`.
 
 Re-run any time — it's idempotent. `install.sh [BINDIR]` links elsewhere. From a
 clone, `./install.sh` works the same. `--print` still runs on the system Python
@@ -302,11 +303,12 @@ Submitting the form appends a `[[connection]]` to the compose file and the new
 card appears immediately. On any card, `t` cycles the endpoint mode and `d` the
 direction live (both rewrite that connection's entry in the compose file).
 
-## `yeet` — one-shot drops across the tailnet
+## Bonus: `yeet` — one-shot drops across the mesh
 
 Connections are for folders that should *stay* the same. `yeet` is for the other
 half: moving one file to whichever machine you happen to be at next. One verb —
-with paths it sends, without them it receives.
+with paths it sends, without them it receives. It installs with everything else,
+so every node that has osync-dash has it already.
 
 ```sh
 yeet report.pdf          # on the laptop
@@ -341,6 +343,19 @@ its own delta transfer, `--partial` resume and progress meter.
 The hub is stored as `yeet_hub` in `[settings]` of the compose file, and is
 guessed on first use from the host your existing connections already talk to.
 On the hub itself the spool is a plain local directory — no ssh round trip.
+
+### Transport
+
+`yeet` is rsync over ssh, so **it needs no Tailscale**. Anything that gets you an
+ssh connection to the hub works the same: plain SSH on a LAN, a hand-rolled
+WireGuard tunnel, a jump host, an `~/.ssh/config` alias, whatever. Tailscale is
+used for exactly two conveniences when it happens to be there — labelling drops
+with the node's tailnet name instead of its hostname, and recognising that the
+hub *is* this machine so the spool can be used locally. Both degrade to the
+plain-ssh behaviour when `tailscale` is absent.
+
+The one requirement is that every node can **reach the hub outbound over ssh**.
+Nothing ever connects to a laptop, so no node needs an open inbound port.
 
 ### Interrupted transfers resume
 
