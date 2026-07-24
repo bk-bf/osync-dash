@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""yeet — park a file on the tailnet, pick it up anywhere.
+
+    yeet report.pdf     on one machine
+    yeet                on another; it lands in the current directory
+
+One verb: with paths it sends, without them it receives. Files travel by rsync
+over ssh through a spool on a hub host (an always-on node in the tailnet), so
+the sender can go offline the moment the upload finishes — nothing needs both
+ends awake at the same time, and no node needs to accept inbound connections.
+
+Stdlib only, and it borrows the tailnet/ssh/compose plumbing from osync_core so
+there is exactly one place that knows how to reach the mesh.
+"""
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import osync_core as oc  # noqa: E402
+from osync_core import BOLD, CYAN, DIM, GREEN, GREY, RED, RESET, YELLOW  # noqa: E402
+
+SPOOL = ".local/share/yeet/spool"  # under the hub user's home
+USAGE = f"""{BOLD}yeet{RESET} — park a file on the tailnet, pick it up anywhere
+
+  {BOLD}yeet{RESET} PATH...        park files/dirs on the hub
+  {BOLD}yeet{RESET}                pull the newest waiting drop into the current dir
+
+  -l, --list          show what is waiting, transfer nothing
+  -a, --all           receive every waiting drop, not just the newest
+  -n, --name NAME     receive the drop whose name contains NAME
+  -k, --keep          receive without clearing it from the hub (fan out)
+  -m, --mine          include drops sent from this machine (skipped by default)
+  -f, --force         overwrite existing files in the target dir
+      --rm [NAME]     delete a waiting drop without receiving it (--all for every)
+      --hub HOST      set the hub host (stored in the osync-dash compose)
+  -h, --help          this
+"""
+
+
+def die(msg: str, code: int = 1):
+    sys.stderr.write(f"{RED}yeet:{RESET} {msg}\n")
+    sys.exit(code)
+
+
+def note(msg: str):
+    sys.stderr.write(f"{DIM}yeet: {msg}{RESET}\n")
+
+
+# ── hub resolution ──────────────────────────────────────────────────────────
+def infer_hub() -> str | None:
+    """Guess the hub: the host most of the osync-dash connections already use."""
+    _, conns = oc.parse_compose()
+    counts: dict[str, int] = {}
+    for c in conns:
+        host = c.get("ts_host") if c.get("mode") in ("ts", "both") else c.get("ssh_host")
+        host = (host or c.get("ssh_host") or c.get("ts_host") or "").strip()
+        if host:
+            counts[host] = counts.get(host, 0) + 1
+    return max(counts, key=counts.get) if counts else None
+
+
+def hub_is_self(host: str) -> bool:
+    """True when this machine *is* the hub — then the spool is just a local dir."""
+    if host.lower() in ("localhost", os.uname().nodename.lower()):
+        return True
+    ts = oc.tailscale_map()
+    me = (ts.get(os.uname().nodename.lower()) or {}).get("name")
+    them = (ts.get(host.lower()) or {}).get("name")
+    if not them:
+        ip = oc.resolve_ssh_host(host)
+        them = (ts.get(ip) or {}).get("name") if ip else None
+    return bool(me and them and me == them)
+
+
+def hub_target() -> dict:
+    """Return {host, user, key, port} for the hub, persisting a first guess."""
+    settings = oc.parse_settings()
+    host = (settings.get("yeet_hub") or "").strip()
+    if not host:
+        host = infer_hub()
+        if not host:
+            die("no hub set and none could be inferred from your osync-dash "
+                "connections — run 'yeet --hub HOST' once")
+        oc.save_settings({"yeet_hub": host})
+        note(f"hub set to '{host}' (from your osync-dash connections) — "
+             f"change it with 'yeet --hub HOST'")
+
+    # Borrow credentials from whichever connection already talks to that host.
+    defaults, conns = oc.parse_compose()
+    match = next((c for c in conns
+                  if host in (c.get("ts_host"), c.get("ssh_host"))), {})
+    port = match.get("ts_port") if match.get("ts_host") == host else match.get("ssh_port")
+    return {
+        "host": host,
+        "user": (match.get("user") or defaults.get("user") or "").strip(),
+        "key": (match.get("key") or defaults.get("key") or "").strip(),
+        "port": str(port or 22),
+        "local": hub_is_self(host),
+    }
+
+
+def ssh_cmd(hub: dict, timeout: int = 10) -> list[str]:
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}",
+           "-o", "ControlPath=none", "-p", hub["port"]]
+    key = os.path.expanduser(hub["key"]) if hub["key"] else ""
+    if key and os.path.exists(key):
+        cmd += ["-i", key]
+    cmd.append(f'{hub["user"]}@{hub["host"]}' if hub["user"] else hub["host"])
+    return cmd
+
+
+def hub_run(hub: dict, script: str, stdin: str | None = None,
+            timeout: int = 30) -> tuple[int, str]:
+    # Spool paths are written relative to the hub user's home, which is where an
+    # ssh command lands — so a local run has to be put there deliberately.
+    cmd = ["sh", "-c", script] if hub["local"] else ssh_cmd(hub) + [script]
+    try:
+        p = subprocess.run(cmd, input=stdin, text=True, capture_output=True,
+                           timeout=timeout,
+                           cwd=os.path.expanduser("~") if hub["local"] else None)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return 255, str(e)
+    return p.returncode, (p.stdout if p.returncode == 0 else (p.stderr or p.stdout))
+
+
+def rsync_transport(hub: dict) -> list[str]:
+    if hub["local"]:
+        return []
+    inner = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+             "-o", "ControlPath=none", "-p", hub["port"]]
+    key = os.path.expanduser(hub["key"]) if hub["key"] else ""
+    if key and os.path.exists(key):
+        inner += ["-i", key]
+    return ["-e", " ".join(shlex.quote(a) for a in inner)]
+
+
+def hub_addr(hub: dict) -> str:
+    return f'{hub["user"]}@{hub["host"]}' if hub["user"] else hub["host"]
+
+
+def spool_path(hub: dict, rel: str) -> str:
+    """An rsync-speakable location inside the spool — remote, or plain local."""
+    if hub["local"]:
+        return os.path.expanduser(f"~/{rel}")
+    return f"{hub_addr(hub)}:{rel}"
+
+
+# ── this node's identity ────────────────────────────────────────────────────
+def this_node() -> str:
+    """Prefer the tailnet name — it is what the other machines will recognise."""
+    node = (oc.parse_settings().get("node") or "").strip()
+    ts = oc.tailscale_map()
+    me = ts.get((node or os.uname().nodename).lower())
+    return (me or {}).get("name") or node or os.uname().nodename
+
+
+# ── send ────────────────────────────────────────────────────────────────────
+def measure(paths: list[Path]) -> tuple[int, int]:
+    files = total = 0
+    for p in paths:
+        if p.is_dir():
+            for root, _, names in os.walk(p):
+                for n in names:
+                    f = Path(root, n)
+                    if f.is_file() and not f.is_symlink():
+                        files += 1
+                        total += f.stat().st_size
+        elif p.is_file():
+            files += 1
+            total += p.stat().st_size
+    return files, total
+
+
+def send(raw: list[str], hub: dict):
+    paths = [Path(p).expanduser().resolve() for p in raw]
+    for p in paths:
+        if not p.exists():
+            die(f"no such file or directory: {p}")
+    names = [p.name for p in paths]
+    files, total = measure(paths)
+
+    drop = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.urandom(2).hex()}"
+    remote = f"{SPOOL}/{drop}"
+    rc, out = hub_run(hub, f"mkdir -p {shlex.quote(remote)}/payload")
+    if rc != 0:
+        die(f"cannot reach the hub ({hub_addr(hub)}): {out.strip() or 'ssh failed'}")
+
+    label = names[0] if len(names) == 1 else f"{len(names)} items"
+    print(f"{DIM}→{RESET} {BOLD}{label}{RESET} {GREY}{oc.humansize(total)}"
+          f"{'' if files == 1 else f' · {files} files'} → {hub['host']}{RESET}",
+          flush=True)
+
+    cmd = (["rsync", "-aH", "--partial", "--info=progress2"]
+           + rsync_transport(hub) + [str(p) for p in paths]
+           + [spool_path(hub, f"{remote}/payload/")])
+    if subprocess.run(cmd).returncode != 0:
+        hub_run(hub, f"rm -rf {shlex.quote(remote)}")
+        die("upload failed — nothing was parked")
+
+    # Manifest last: until it exists the drop is invisible, so a half-finished
+    # upload can never be picked up.
+    manifest = json.dumps({"id": drop, "from": this_node(), "created": int(time.time()),
+                           "items": names, "bytes": total, "files": files})
+    rc, out = hub_run(hub, f"cat > {shlex.quote(remote)}/manifest.json", stdin=manifest)
+    if rc != 0:
+        hub_run(hub, f"rm -rf {shlex.quote(remote)}")
+        die(f"could not finalise the drop: {out.strip()}")
+
+    print(f"{GREEN}✓{RESET} parked as {BOLD}{drop}{RESET} — run {BOLD}yeet{RESET} "
+          f"anywhere in the tailnet to pick it up")
+
+
+# ── receive ─────────────────────────────────────────────────────────────────
+def fetch_drops(hub: dict) -> list[dict]:
+    # `exit 0` because an empty spool leaves the glob unexpanded and the loop
+    # failing — that is "nothing waiting", not an unreachable hub.
+    rc, out = hub_run(hub,
+                      f'for m in ~/{SPOOL}/*/manifest.json; do '
+                      f'[ -f "$m" ] && cat "$m" && echo; done; exit 0')
+    if rc != 0:
+        die(f"cannot reach the hub ({hub_addr(hub)}): {out.strip() or 'ssh failed'}")
+    drops = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if d.get("id"):
+            drops.append(d)
+    return sorted(drops, key=lambda d: d.get("created", 0))
+
+
+def describe(d: dict, me: str) -> str:
+    items = d.get("items") or ["?"]
+    label = items[0] if len(items) == 1 else f"{len(items)} items"
+    files = d.get("files", 0)
+    who = d.get("from", "?")
+    tag = f" {DIM}(yours){RESET}" if who == me else ""
+    age = oc.human_age(max(0, int(time.time()) - int(d.get("created", 0))))
+    return (f"{BOLD}{label}{RESET}{tag}  {GREY}{oc.humansize(d.get('bytes', 0))}"
+            f"{'' if files == 1 else f' · {files} files'}  ← {who}  {age} ago{RESET}")
+
+
+def select(drops: list[dict], me: str, name: str | None, want_all: bool,
+           mine: bool) -> list[dict]:
+    pool = [d for d in drops if mine or d.get("from") != me]
+    if name:
+        pool = [d for d in pool
+                if name.lower() in d["id"].lower()
+                or any(name.lower() in i.lower() for i in (d.get("items") or []))]
+        if not pool:
+            die(f"nothing waiting matches '{name}'")
+    if not pool:
+        if drops:
+            die("nothing waiting for this machine (only your own drops — "
+                "use -m to take one anyway)")
+        die("nothing waiting on the hub")
+    return pool if want_all else [pool[-1]]
+
+
+def receive(hub: dict, name: str | None, want_all: bool, keep: bool,
+            mine: bool, force: bool):
+    me = this_node()
+    picked = select(fetch_drops(hub), me, name, want_all, mine)
+    dest = Path.cwd()
+
+    if not force:
+        clashes = sorted({i for d in picked for i in (d.get("items") or [])
+                          if (dest / i).exists()})
+        if clashes:
+            die(f"already here: {', '.join(clashes)} — move them or use -f")
+
+    for d in picked:
+        print(f"{DIM}←{RESET} {describe(d, me)}", flush=True)
+        cmd = (["rsync", "-aH", "--partial", "--info=progress2"]
+               + rsync_transport(hub)
+               + [spool_path(hub, f'{SPOOL}/{d["id"]}/payload/'), str(dest) + "/"])
+        if subprocess.run(cmd).returncode != 0:
+            die(f"download failed — {d['id']} is still on the hub")
+        if not keep:
+            hub_run(hub, "rm -rf " + shlex.quote(f"{SPOOL}/{d['id']}"))
+        for i in d.get("items") or []:
+            print(f"{GREEN}✓{RESET} ./{i}")
+
+
+def show_list(hub: dict):
+    drops = fetch_drops(hub)
+    me = this_node()
+    if not drops:
+        print(f"{DIM}nothing waiting on {hub['host']}{RESET}")
+        return
+    for d in drops:
+        print(f"  {describe(d, me)}  {DIM}{d['id']}{RESET}")
+
+
+def remove(hub: dict, name: str | None, want_all: bool):
+    drops = fetch_drops(hub)
+    if not drops:
+        die("nothing waiting on the hub")
+    picked = select(drops, this_node(), name, want_all, mine=True)
+    for d in picked:
+        hub_run(hub, "rm -rf " + shlex.quote(f"{SPOOL}/{d['id']}"))
+        items = d.get("items") or ["?"]
+        label = items[0] if len(items) == 1 else f"{len(items)} items"
+        print(f"{YELLOW}✗{RESET} dropped {BOLD}{label}{RESET} {DIM}{d['id']}{RESET}")
+
+
+# ── cli ─────────────────────────────────────────────────────────────────────
+def main():
+    argv = sys.argv[1:]
+    paths, name = [], None
+    want_all = keep = mine = force = do_list = do_rm = False
+
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            print(USAGE, end="")
+            return
+        elif a in ("-l", "--list"):
+            do_list = True
+        elif a in ("-a", "--all"):
+            want_all = True
+        elif a in ("-k", "--keep"):
+            keep = True
+        elif a in ("-m", "--mine"):
+            mine = True
+        elif a in ("-f", "--force"):
+            force = True
+        elif a == "--rm":
+            do_rm = True
+        elif a in ("-n", "--name"):
+            i += 1
+            if i >= len(argv):
+                die("-n needs a name")
+            name = argv[i]
+        elif a == "--hub":
+            i += 1
+            if i >= len(argv):
+                die("--hub needs a host")
+            oc.save_settings({"yeet_hub": argv[i]})
+            print(f"{GREEN}✓{RESET} hub is now {BOLD}{argv[i]}{RESET}")
+            return
+        elif a.startswith("-") and a != "-":
+            die(f"unknown option {a} (try --help)")
+        else:
+            paths.append(a)
+        i += 1
+
+    hub = hub_target()
+    if do_rm:
+        remove(hub, name or (paths[0] if paths else None), want_all)
+    elif do_list:
+        show_list(hub)
+    elif paths:
+        send(paths, hub)
+    else:
+        receive(hub, name, want_all, keep, mine, force)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

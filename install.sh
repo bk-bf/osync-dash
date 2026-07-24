@@ -66,6 +66,7 @@ PY
   echo "  • all systemd --user units  osync-dash-*  (stopped + disabled)"
   echo "  • $cache/generated and $cache/*.log"
   echo "  • the compose file  $compose"
+  echo "  • the yeet spool  ~/.local/share/yeet  (any drops parked here, undelivered)"
   echo "  • .osync_workdir in each LOCAL synced dir"
   echo "    ⚠ that deletes osync's soft-delete + conflict-backup safety net"
   [ "$purge_remote" = 1 ] && echo "  • .osync_workdir on each REMOTE replica too (--purge-remote)"
@@ -111,11 +112,15 @@ PY
   say "removed compose + cache"
 
   # 4. launcher symlinks (only if they're symlinks — never a real file)
-  for a in "$HOME/.local/bin/osync-dash" "$HOME/bin/osync-dash" "/usr/local/bin/osync-dash"; do
+  for a in "$HOME/.local/bin/osync-dash" "$HOME/bin/osync-dash" "/usr/local/bin/osync-dash" \
+           "$HOME/.local/bin/yeet" "$HOME/bin/yeet" "/usr/local/bin/yeet"; do
     [ -L "$a" ] && rm -f "$a" && say "removed $a"
   done
-  a="$(command -v osync-dash 2>/dev/null || true)"
-  [ -n "$a" ] && [ -L "$a" ] && rm -f "$a" && say "removed $a"
+  for n in osync-dash yeet; do
+    a="$(command -v "$n" 2>/dev/null || true)"
+    [ -n "$a" ] && [ -L "$a" ] && rm -f "$a" && say "removed $a"
+  done
+  rm -rf "$HOME/.local/share/yeet"; say "removed the yeet spool"
 
   # 5. the install prefix (vendored osync + venv + src) — last, we may run from it
   rm -rf "$PREFIX"; say "removed $PREFIX"
@@ -192,10 +197,13 @@ python3 -m venv "$SRC/.venv"
 mkdir -p "$BIN"
 ln -sfn "$SRC/osync-dash" "$BIN/osync-dash"
 say "linked $BIN/osync-dash -> $SRC/osync-dash"
+ln -sfn "$SRC/yeet" "$BIN/yeet"
+say "linked $BIN/yeet -> $SRC/yeet"
 say "vendored osync: $("$OSYNC_DIR/osync.sh" --version 2>&1 | head -1)"
 echo
 echo "done. Ensure $BIN is on your PATH, then run:"
 echo "    osync-dash                        # the TUI"
 echo "    osync-dash --print                # one-shot render"
+echo "    yeet FILE / yeet                  # one-shot drops across the tailnet"
 echo "    $SRC/install.sh --remote user@host  # match osync on a replica"
 echo "    $SRC/install.sh --uninstall         # remove everything"

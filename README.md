@@ -5,7 +5,9 @@ two-way sync jobs, built with [Textual](https://github.com/Textualize/textual).
 **One compose file defines many connections** (docker-compose style), and each
 gets its own always-expanded card: merged health + sync-state, both machines
 (local + remote over SSH, with hostnames and Tailscale identity), live
-↑push/↓pull activity, paths, and the soft-delete/backup safety net.
+↑push/↓pull activity, paths, and the soft-delete/backup safety net. Ships with
+[`yeet`](#yeet--one-shot-drops-across-the-tailnet) for one-shot file drops
+between the same machines.
 
 ```
 ┌ ubuntuserver  ⇄ ──────────────────────────────────────────────────────────┐
@@ -44,6 +46,8 @@ to the focused one.
   app. The one third-party dependency, kept in a project virtualenv.
 - **`osync-dash`** — thin launcher: interactive → Textual (venv); otherwise →
   the stdlib one-shot renderer.
+- **`yeet`** — one-shot file drops across the tailnet (see below). Standard
+  library only, and it borrows `osync_core`'s tailnet/ssh/compose plumbing.
 - **`versions.env`** — pinned dependency versions (osync ref + Textual), read by
   `install.sh`. The single place to bump versions.
 - **`noctalia-plugin/`** — optional [Noctalia](https://noctalia.dev) bar widget
@@ -297,6 +301,53 @@ controller:
 Submitting the form appends a `[[connection]]` to the compose file and the new
 card appears immediately. On any card, `t` cycles the endpoint mode and `d` the
 direction live (both rewrite that connection's entry in the compose file).
+
+## `yeet` — one-shot drops across the tailnet
+
+Connections are for folders that should *stay* the same. `yeet` is for the other
+half: moving one file to whichever machine you happen to be at next. One verb —
+with paths it sends, without them it receives.
+
+```sh
+yeet report.pdf          # on the laptop
+yeet                     # on any other node; it lands in the current directory
+```
+
+No target host, no passphrase, no code to type. The file is rsynced to a spool
+on a **hub** — an always-on node in the tailnet — and the receiving side pulls it
+down and clears it. Because the hub holds the file, **the sender can go offline
+the moment the upload finishes**; nothing needs both ends awake at once, and no
+node has to accept inbound connections.
+
+```
+[laptop]              [hub]                 [desktop]
+yeet report.pdf  ─────▶  spool/
+                         spool/  ─────▶  yeet  →  ./report.pdf
+```
+
+Directories work (`yeet ~/notes`), so do several paths at once, and rsync brings
+its own delta transfer, `--partial` resume and progress meter.
+
+| flag | |
+|---|---|
+| `-l`, `--list` | show what is waiting, transfer nothing |
+| `-a`, `--all` | receive every waiting drop, not just the newest |
+| `-n NAME` | receive the drop whose name contains `NAME` |
+| `-k`, `--keep` | receive without clearing it — fan the same drop out to several machines |
+| `-m`, `--mine` | include drops sent from this machine (skipped by default) |
+| `-f`, `--force` | overwrite existing files in the target directory |
+| `--rm [NAME]` | delete a waiting drop without receiving it (`--all` for every) |
+| `--hub HOST` | set the hub host |
+
+The hub is stored as `yeet_hub` in `[settings]` of the compose file, and is
+guessed on first use from the host your existing connections already talk to.
+On the hub itself the spool is a plain local directory — no ssh round trip.
+
+Two safety rules: a drop is only visible once its manifest lands, so a
+half-finished upload can never be picked up; and a receive **refuses** rather
+than overwriting a file that already exists in the target directory (`-f`
+overrides). Your own drops are skipped by default so `yeet file` followed by
+`yeet` somewhere else on the same machine can't quietly re-download itself.
 
 ## Auto-sync (off · on-change · periodic)
 
