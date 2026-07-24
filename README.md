@@ -1,4 +1,4 @@
-# osync-dash
+# osd
 
 An interactive terminal dashboard for [osync](https://github.com/deajan/osync)
 two-way sync jobs, built with [Textual](https://github.com/Textualize/textual).
@@ -39,15 +39,15 @@ to the focused one.
 
 ## Architecture
 
-- **`osync_core.py`** — data layer + one-shot renderer. **Standard library only**,
+- **`osd_core.py`** — data layer + one-shot renderer. **Standard library only**,
   runs on the system Python. Powers `--print`, `--json`, all the probing, and the
   log parsing.
-- **`osync_tui.py`** — the interactive [Textual](https://textual.textualize.io)
+- **`osd_tui.py`** — the interactive [Textual](https://textual.textualize.io)
   app. The one third-party dependency, kept in a project virtualenv.
-- **`osync-dash`** — thin launcher: interactive → Textual (venv); otherwise →
+- **`osd`** — thin launcher: interactive → Textual (venv); otherwise →
   the stdlib one-shot renderer.
 - **`yeet`** — one-shot file drops across the tailnet (see below). Standard
-  library only, and it borrows `osync_core`'s tailnet/ssh/compose plumbing.
+  library only, and it borrows `osd_core`'s tailnet/ssh/compose plumbing.
 - **`versions.env`** — pinned dependency versions (osync ref + Textual), read by
   `install.sh`. The single place to bump versions.
 - **`noctalia-plugin/`** — optional [Noctalia](https://noctalia.dev) bar widget
@@ -60,7 +60,7 @@ while `--print` stays dependency-free for scripts, cron, and non-TTY pipes, and
 ## Machine-readable output (`--json`)
 
 ```sh
-osync-dash --json [--local-only]
+osd --json [--local-only]
 ```
 
 Emits every connection as one JSON object on stdout and exits — stdlib only, no
@@ -118,7 +118,7 @@ was verified in sync moments earlier.
 ## Noctalia plugin (optional)
 
 `noctalia-plugin/` is a desktop widget for the [Noctalia](https://noctalia.dev)
-shell that runs `osync-dash --json` and renders sync health in your bar, with a
+shell that runs `osd --json` and renders sync health in your bar, with a
 click-through panel showing every connection. It reimplements nothing — same
 probing, same health rules.
 
@@ -149,10 +149,10 @@ curl -fsSL https://raw.githubusercontent.com/bk-bf/osync-dash/main/install.sh | 
 
 The installer:
 
-1. fetches osync-dash into `~/.local/share/osync-dash/`,
+1. fetches osd into `~/.local/share/osd/`,
 2. **vendors the pinned osync** (`versions.env`) into `…/osync/osync.sh`,
 3. creates the Textual `.venv` with the pinned Textual,
-4. symlinks `osync-dash` and [`yeet`](#bonus-yeet--one-shot-drops-across-the-mesh)
+4. symlinks `osd` and [`yeet`](#bonus-yeet--one-shot-drops-across-the-mesh)
    into `~/.local/bin`.
 
 Re-run any time — it's idempotent. `install.sh [BINDIR]` links elsewhere. From a
@@ -161,13 +161,13 @@ clone, `./install.sh` works the same. `--print` still runs on the system Python
 
 ### Version pinning & replicas
 
-Everything osync-dash runs uses the osync build pinned in `versions.env`, so
+Everything osd runs uses the osync build pinned in `versions.env`, so
 behaviour — and osync's **log format**, which the dashboard parses — is identical
 on every machine. To put that same byte-identical osync on a replica (osync.sh
 is a single self-contained script):
 
 ```sh
-~/.local/share/osync-dash/src/install.sh --remote user@host
+~/.local/share/osd/src/install.sh --remote user@host
 ```
 
 Bump a version by editing `versions.env` and re-running `install.sh` (and
@@ -176,11 +176,11 @@ Bump a version by editing `versions.env` and re-running `install.sh` (and
 ### Uninstall
 
 ```sh
-~/.local/share/osync-dash/src/install.sh --uninstall
+~/.local/share/osd/src/install.sh --uninstall
 ```
 
 Prompts, then removes **everything on this machine** it created: the launcher
-symlink, the install prefix (vendored osync + venv), all `osync-dash-*` systemd
+symlink, the install prefix (vendored osync + venv), all `osd-*` systemd
 units (stopped + disabled), the generated confs and logs, the compose file, and
 `.osync_workdir` in each local synced dir. Add `--purge-remote` to also wipe
 `.osync_workdir` on the replicas over ssh, or `--yes` to skip the prompt. **Your
@@ -191,16 +191,16 @@ legacy `~/.config/osync/*.conf` are also left alone.
 ## Usage
 
 ```sh
-osync-dash              # interactive Textual TUI — every connection, all at once
+osd              # interactive Textual TUI — every connection, all at once
 ```
 
 All connections live in a single compose file,
-**`~/.config/osync/osync-dash.toml`** — no picker, no prompt. On first run, any
+**`~/.config/osync/osd.toml`** — no picker, no prompt. On first run, any
 existing `~/.config/osync/*.conf` jobs are folded into it automatically (the old
 files are left untouched).
 
 ```toml
-# ~/.config/osync/osync-dash.toml
+# ~/.config/osync/osd.toml
 [defaults]
 user = "ubuntu"
 key  = "~/.ssh/id_ed25519"
@@ -225,7 +225,7 @@ ssh_host = "laptop.local"
 
 Each `[[connection]]` is a two-way osync job between **this machine** and a host
 (so a mesh like `server ⇄ desktop ⇄ laptop` is just two connections on the
-desktop). osync-dash materialises a real osync `.conf` per connection into
+desktop). osd materialises a real osync `.conf` per connection into
 `~/.cache/osync/generated/` when it needs to run osync — the compose file stays
 the single source of truth.
 
@@ -254,8 +254,8 @@ palette, with gradient disk meters per machine.
 
 ## Mesh model: every node pushes its own changes
 
-osync-dash is meant to run on **every device in the mesh** (Tailscale-style),
-and the dashboard is titled with the node you're on (`osync-dash · <hostname>`)
+osd is meant to run on **every device in the mesh** (Tailscale-style),
+and the dashboard is titled with the node you're on (`osd · <hostname>`)
 — you see the mesh from *this node's* point of view.
 
 The default topology is **push, not bidirectional**: each device is the sole
@@ -284,13 +284,13 @@ either pushes, the newer edit wins and the older is kept as a conflict backup.
 
 ## Mesh: add hosts, browse dirs, pick a direction
 
-Press `a` for a setup form that turns osync-dash into a little sync-mesh
+Press `a` for a setup form that turns osd into a little sync-mesh
 controller:
 
 - **Import a device** — a dropdown of your Tailscale peers (online/OS shown), or
   "manual entry". Picking one fills in its host.
 - **Endpoint mode** — Tailscale / Plain SSH / **Both**. The form is dynamic: it
-  only asks for the hosts the chosen mode needs. In **both** mode osync-dash
+  only asks for the hosts the chosen mode needs. In **both** mode osd
   prefers Tailscale and **falls back to plain SSH** automatically when Tailscale
   is unreachable (it repoints `TARGET_SYNC_DIR` to whichever answers).
 - **Directory autocomplete** — type in the remote-dir field and it lists real
@@ -308,7 +308,7 @@ direction live (both rewrite that connection's entry in the compose file).
 Connections are for folders that should *stay* the same. `yeet` is for the other
 half: moving one file to whichever machine you happen to be at next. One verb —
 with paths it sends, without them it receives. It installs with everything else,
-so every node that has osync-dash has it already.
+so every node that has osd has it already.
 
 ```sh
 yeet report.pdf          # on the laptop
@@ -385,7 +385,7 @@ the target directory — `-f` overrides.
 
 osync is a batch tool — one run, one reconciliation, then it exits. By default
 nothing syncs until you press `s`. Press **`A`** on a card to open the auto-sync
-picker; osync-dash writes and manages a **systemd `--user`** unit for it:
+picker; osd writes and manages a **systemd `--user`** unit for it:
 
 - **on file change** — runs `osync.sh <conf> --on-changes`, osync's inotify
   monitor, as a long-lived service. Syncs shortly after changes settle.
@@ -399,7 +399,7 @@ picker; osync-dash writes and manages a **systemd `--user`** unit for it:
 
 Each card's **auto-sync** line shows the live unit state — `next in 4m · last
 ok`, or a red `⚠ last run failed` you can jump into with `l`. Units are
-`osync-dash-<name>.{service,timer}` under `~/.config/systemd/user/`, and survive
+`osd-<name>.{service,timer}` under `~/.config/systemd/user/`, and survive
 logout/reboot when user lingering is on (`loginctl enable-linger $USER`).
 
 **Scheduled and continuous syncs run through the deletion guard** (below), so an
@@ -414,7 +414,7 @@ they travel with your config and stay portable across machines:
   `notify-send`; point it at `dunstify`, a wrapper script, or anything taking
   `<cmd> TITLE BODY`. You get a notification when a sync fails or is blocked.
 - **Deletion guard** — `delete_guard = N`: before any sync (manual *or*
-  automatic) osync-dash checks the dry-run, and if it would propagate more than
+  automatic) osd checks the dry-run, and if it would propagate more than
   `N` deletions it **blocks and notifies** instead of running. A manual `s`
   turns this into an "are you sure?" you can override; an automatic run just
   skips and flags the card. Set `0` to disable. Guards against the classic
@@ -424,11 +424,11 @@ they travel with your config and stay portable across machines:
 ### Non-interactive
 
 ```sh
-osync-dash --print          # one-shot render to stdout (automatic when piped)
-osync-dash --print --fast    # skip the pending dry-run
-osync-dash --sync           # run the sync, print the result, exit
-osync-dash --log            # page the osync log, exit
-osync-dash --local-only     # offline: skip the remote probe
+osd --print          # one-shot render to stdout (automatic when piped)
+osd --print --fast    # skip the pending dry-run
+osd --sync           # run the sync, print the result, exit
+osd --log            # page the osync log, exit
+osd --local-only     # offline: skip the remote probe
 ```
 
 ## How it reads status

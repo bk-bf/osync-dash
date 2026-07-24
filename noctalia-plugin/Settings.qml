@@ -39,9 +39,9 @@ Item {
     NTextInput {
       id: binInput
       Layout.fillWidth: true
-      label: "osync-dash path"
-      description: "The launcher installed by osync-dash's install.sh. A leading ~ is expanded; the path must not contain spaces."
-      placeholderText: "~/.local/bin/osync-dash"
+      label: "osd path"
+      description: "The launcher installed by osd's install.sh. A leading ~ is expanded; the path must not contain spaces."
+      placeholderText: "~/.local/bin/osd"
       text: (root.cfg && root.cfg.binPath) || ""
     }
 
@@ -106,7 +106,7 @@ Item {
       id: termInput
       Layout.fillWidth: true
       label: "Terminal command"
-      description: "Used by \"Open osync-dash TUI\". Launched as `<terminal> -e <osync-dash>`."
+      description: "Used by \"Open osd TUI\". Launched as `<terminal> -e <osd>`."
       placeholderText: "kitty"
       text: (root.cfg && root.cfg.terminalCmd) || ""
     }

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""osync-dash launcher.
+"""osd launcher.
 
-Interactive by default: runs the Textual TUI (osync_tui.py) under the project
-virtualenv. Falls back to the stdlib one-shot renderer (osync_core.py) for
+Interactive by default: runs the Textual TUI (osd_tui.py) under the project
+virtualenv. Falls back to the stdlib one-shot renderer (osd_core.py) for
 --print / --sync / --log / --help or when output is not a TTY, so the core has
 no third-party dependencies and always works with the system Python.
 """
@@ -12,7 +12,7 @@ import sys
 HERE = os.path.dirname(os.path.realpath(__file__))
 argv = sys.argv[1:]
 
-_one_off = {"-p", "--print", "--once", "--sync", "--log", "--guarded-sync",
+_one_off = {"-p", "--print", "--once", "--sync", "--log", "--guarded-sync", "-U", "--update",
             "--json", "--status", "-h", "--help"}
 want_tui = (
     not any(a in _one_off for a in argv)
@@ -22,16 +22,16 @@ want_tui = (
 
 if want_tui:
     venv_py = os.path.join(HERE, ".venv", "bin", "python")
-    tui = os.path.join(HERE, "osync_tui.py")
+    tui = os.path.join(HERE, "osd_tui.py")
     if os.path.exists(venv_py) and os.path.exists(tui):
         os.execv(venv_py, [venv_py, tui, *argv])  # hand off to Textual
     sys.stderr.write(
-        "osync-dash: TUI virtualenv missing — run ./install.sh in the project.\n"
+        "osd: TUI virtualenv missing — run ./install.sh in the project.\n"
         "            Showing the one-shot view instead.\n\n"
     )
 
 # One-shot / non-interactive path: stdlib core, system Python.
 sys.path.insert(0, HERE)
-import osync_core  # noqa: E402
+import osd_core  # noqa: E402
 
-osync_core.main()
+osd_core.main()

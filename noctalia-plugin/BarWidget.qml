@@ -58,7 +58,7 @@ Item {
         "icon": "refresh"
       },
       {
-        "label": "Open osync-dash TUI",
+        "label": "Open osd TUI",
         "action": "tui",
         "icon": "external-link"
       },

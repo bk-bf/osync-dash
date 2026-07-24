@@ -1,5 +1,5 @@
 {
-  "id": "osync-dash",
+  "id": "osd",
   "name": "osync",
   "version": "0.1.0",
   "author": "bk-bf",
@@ -17,7 +17,7 @@
     "textColor": "none",
     "cpuIntensive": false,
     "defaultSettings": {
-      "binPath": "~/.local/bin/osync-dash",
+      "binPath": "~/.local/bin/osd",
       "intervalMs": 20000,
       "localOnly": false,
       "barMetric": "auto",

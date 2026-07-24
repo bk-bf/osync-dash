@@ -9,7 +9,7 @@ over ssh through a spool on a hub host (an always-on node in the tailnet), so
 the sender can go offline the moment the upload finishes — nothing needs both
 ends awake at the same time, and no node needs to accept inbound connections.
 
-Stdlib only, and it borrows the tailnet/ssh/compose plumbing from osync_core so
+Stdlib only, and it borrows the tailnet/ssh/compose plumbing from osd_core so
 there is exactly one place that knows how to reach the mesh.
 """
 import json
@@ -21,8 +21,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-import osync_core as oc  # noqa: E402
-from osync_core import BOLD, CYAN, DIM, GREEN, GREY, RED, RESET, YELLOW  # noqa: E402
+import osd_core as oc  # noqa: E402
+from osd_core import BOLD, CYAN, DIM, GREEN, GREY, RED, RESET, YELLOW  # noqa: E402
 
 SPOOL = ".local/share/yeet/spool"  # under the hub user's home
 PART = ".yeet-part"                # rsync parks in-flight chunks here
@@ -38,7 +38,7 @@ USAGE = f"""{BOLD}yeet{RESET} — park a file on the tailnet, pick it up anywher
   -k, --keep          receive without clearing it from the hub (fan out)
   -f, --force         overwrite existing files in the target dir
       --rm [NAME]     delete a waiting drop without receiving it (--all for every)
-      --hub HOST      set the hub host (stored in the osync-dash compose)
+      --hub HOST      set the hub host (stored in the osd compose)
   -h, --help          this
 """
 
@@ -54,7 +54,7 @@ def note(msg: str):
 
 # ── hub resolution ──────────────────────────────────────────────────────────
 def infer_hub() -> str | None:
-    """Guess the hub: the host most of the osync-dash connections already use."""
+    """Guess the hub: the host most of the osd connections already use."""
     _, conns = oc.parse_compose()
     counts: dict[str, int] = {}
     for c in conns:
@@ -85,10 +85,10 @@ def hub_target() -> dict:
     if not host:
         host = infer_hub()
         if not host:
-            die("no hub set and none could be inferred from your osync-dash "
+            die("no hub set and none could be inferred from your osd "
                 "connections — run 'yeet --hub HOST' once")
         oc.save_settings({"yeet_hub": host})
-        note(f"hub set to '{host}' (from your osync-dash connections) — "
+        note(f"hub set to '{host}' (from your osd connections) — "
              f"change it with 'yeet --hub HOST'")
 
     # Borrow credentials from whichever connection already talks to that host.

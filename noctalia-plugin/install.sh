@@ -7,7 +7,7 @@
 #   ./install.sh --uninstall  remove the link
 set -euo pipefail
 
-ID="osync-dash"
+ID="osd"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST="${XDG_CONFIG_HOME:-$HOME/.config}/noctalia/plugins/$ID"
 
@@ -30,10 +30,10 @@ mkdir -p "$(dirname "$DEST")"
 ln -sfn "$SRC" "$DEST"
 echo "linked $DEST -> $SRC"
 
-# The plugin shells out to the osync-dash launcher; warn early if it is missing.
-if ! command -v osync-dash >/dev/null 2>&1 && [[ ! -x "$HOME/.local/bin/osync-dash" ]]; then
+# The plugin shells out to the osd launcher; warn early if it is missing.
+if ! command -v osd >/dev/null 2>&1 && [[ ! -x "$HOME/.local/bin/osd" ]]; then
   echo
-  echo "warning: osync-dash not found on PATH or at ~/.local/bin/osync-dash." >&2
+  echo "warning: osd not found on PATH or at ~/.local/bin/osd." >&2
   echo "         Run this repo's ../install.sh first — the plugin depends on it." >&2
 fi
 

@@ -1,7 +1,7 @@
 // Panel.qml — the detail view opened by clicking the bar pill.
 //
 // This is a one-to-one port of the TUI's connection card (card_body() in
-// osync_tui.py): same rows, same order, same wording, same semantic colours.
+// osd_tui.py): same rows, same order, same wording, same semantic colours.
 // Anything shown here is shown there — no invented terminology, no reordering.
 //
 //   <name>  ⇄
@@ -123,7 +123,7 @@ Item {
       }
       NIconButton {
         icon: "external-link"
-        tooltipText: "Open the osync-dash TUI"
+        tooltipText: "Open the osd TUI"
         baseSize: Style.baseWidgetSize * 0.8
         onClicked: if (root.svc)
           root.svc.openTui()
@@ -143,7 +143,7 @@ Item {
         anchors.margins: Style.marginM
         spacing: Style.marginXXS
         NText {
-          text: "Can't run osync-dash"
+          text: "Can't run osd"
           font.weight: Style.fontWeightSemiBold
           color: Color.mError
         }

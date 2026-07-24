@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# osync-dash installer — curl-pipeable and idempotent.
+# osd installer — curl-pipeable and idempotent.
 #
 #   curl -fsSL https://raw.githubusercontent.com/bk-bf/osync-dash/main/install.sh | bash
 #
@@ -10,18 +10,18 @@
 #   install.sh [BINDIR]                 install here (BINDIR defaults to ~/.local/bin)
 #   install.sh --remote user@host       copy the pinned osync onto a remote replica
 #   install.sh --print-osync            print the path to the vendored osync.sh
-#   install.sh --uninstall [--yes]      remove osync-dash, its osync, units, and
+#   install.sh --uninstall [--yes]      remove osd, its osync, units, and
 #                                       every setup it created on this machine
 #   install.sh --uninstall --purge-remote   also wipe .osync_workdir on replicas
 #
-# Env: OSYNC_DASH_HOME (default ~/.local/share/osync-dash), OSYNC_DASH_REPO.
+# Env: OSD_HOME (default ~/.local/share/osd), OSD_REPO.
 set -euo pipefail
 
-REPO="${OSYNC_DASH_REPO:-https://github.com/bk-bf/osync-dash.git}"
-PREFIX="${OSYNC_DASH_HOME:-$HOME/.local/share/osync-dash}"
+REPO="${OSD_REPO:-https://github.com/bk-bf/osync-dash.git}"
+PREFIX="${OSD_HOME:-$HOME/.local/share/osd}"
 
 say() { printf '→ %s\n' "$*" >&2; }  # stderr: never pollute $(resolve_src) etc.
-die() { printf 'osync-dash install: %s\n' "$*" >&2; exit 1; }
+die() { printf 'osd install: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
 
 # ── uninstall — removes everything this installer + the TUI ever created ──────
@@ -35,7 +35,7 @@ uninstall() {
       *) die "unknown uninstall flag: $a" ;;
     esac
   done
-  local compose="$HOME/.config/osync/osync-dash.toml"
+  local compose="$HOME/.config/osync/osd.toml"
   local cache="$HOME/.cache/osync"
 
   # read each connection's dirs from the compose *before* deleting it
@@ -61,9 +61,9 @@ PY
 )"
   fi
 
-  echo "osync-dash uninstall will remove:"
+  echo "osd uninstall will remove:"
   echo "  • the launcher symlink(s) and $PREFIX (src, vendored osync, venv)"
-  echo "  • all systemd --user units  osync-dash-*  (stopped + disabled)"
+  echo "  • all systemd --user units  osd-*  (stopped + disabled)"
   echo "  • $cache/generated and $cache/*.log"
   echo "  • the compose file  $compose"
   echo "  • the yeet spool  ~/.local/share/yeet  (any drops parked here, undelivered)"
@@ -79,11 +79,11 @@ PY
 
   # 1. systemd units
   if command -v systemctl >/dev/null 2>&1; then
-    for a in $(systemctl --user list-unit-files --no-legend 'osync-dash-*' 2>/dev/null | awk '{print $1}'); do
+    for a in $(systemctl --user list-unit-files --no-legend 'osd-*' 2>/dev/null | awk '{print $1}'); do
       systemctl --user disable --now "$a" >/dev/null 2>&1 || true
     done
-    rm -f "$HOME/.config/systemd/user/"osync-dash-*.service \
-          "$HOME/.config/systemd/user/"osync-dash-*.timer 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/"osd-*.service \
+          "$HOME/.config/systemd/user/"osd-*.timer 2>/dev/null || true
     systemctl --user daemon-reload >/dev/null 2>&1 || true
     say "removed systemd units"
   fi
@@ -112,11 +112,11 @@ PY
   say "removed compose + cache"
 
   # 4. launcher symlinks (only if they're symlinks — never a real file)
-  for a in "$HOME/.local/bin/osync-dash" "$HOME/bin/osync-dash" "/usr/local/bin/osync-dash" \
+  for a in "$HOME/.local/bin/osd" "$HOME/bin/osd" "/usr/local/bin/osd" \
            "$HOME/.local/bin/yeet" "$HOME/bin/yeet" "/usr/local/bin/yeet"; do
     [ -L "$a" ] && rm -f "$a" && say "removed $a"
   done
-  for n in osync-dash yeet; do
+  for n in osd yeet; do
     a="$(command -v "$n" 2>/dev/null || true)"
     [ -n "$a" ] && [ -L "$a" ] && rm -f "$a" && say "removed $a"
   done
@@ -124,7 +124,7 @@ PY
 
   # 5. the install prefix (vendored osync + venv + src) — last, we may run from it
   rm -rf "$PREFIX"; say "removed $PREFIX"
-  echo; echo "osync-dash uninstalled."
+  echo; echo "osd uninstalled."
 }
 
 if [ "${1:-}" = "--uninstall" ]; then shift; uninstall "$@"; exit 0; fi
@@ -133,11 +133,11 @@ if [ "${1:-}" = "--uninstall" ]; then shift; uninstall "$@"; exit 0; fi
 # When run from a checkout we use it in place; when piped through curl we clone.
 resolve_src() {
   local self="${BASH_SOURCE[0]:-}"
-  if [ -n "$self" ] && [ -f "$(dirname "$self")/osync_core.py" ]; then
+  if [ -n "$self" ] && [ -f "$(dirname "$self")/osd_core.py" ]; then
     (cd "$(dirname "$self")" && pwd)
   else
     need git
-    say "fetching osync-dash → $PREFIX/src"
+    say "fetching osd → $PREFIX/src"
     rm -rf "$PREFIX/src"; mkdir -p "$PREFIX"
     git clone --depth 1 "$REPO" "$PREFIX/src" >/dev/null 2>&1 || die "git clone failed ($REPO)"
     printf '%s\n' "$PREFIX/src"
@@ -169,12 +169,12 @@ deploy_remote() {
   local host="$1"; [ -n "$host" ] || die "--remote needs user@host"
   vendor_osync
   say "deploying osync $OSYNC_VERSION → $host"
-  ssh "$host" 'mkdir -p ~/.local/share/osync-dash/osync ~/.local/bin' \
+  ssh "$host" 'mkdir -p ~/.local/share/osd/osync ~/.local/bin' \
     || die "ssh to $host failed"
-  scp -q "$OSYNC_DIR/osync.sh" "$host:.local/share/osync-dash/osync/osync.sh"
-  ssh "$host" 'chmod +x ~/.local/share/osync-dash/osync/osync.sh &&
-    ln -sfn ~/.local/share/osync-dash/osync/osync.sh ~/.local/bin/osync.sh &&
-    printf "→ remote now on: " && ~/.local/share/osync-dash/osync/osync.sh --version 2>&1 | head -1'
+  scp -q "$OSYNC_DIR/osync.sh" "$host:.local/share/osd/osync/osync.sh"
+  ssh "$host" 'chmod +x ~/.local/share/osd/osync/osync.sh &&
+    ln -sfn ~/.local/share/osd/osync/osync.sh ~/.local/bin/osync.sh &&
+    printf "→ remote now on: " && ~/.local/share/osd/osync/osync.sh --version 2>&1 | head -1'
   say "done — $host matches osync $OSYNC_VERSION"
 }
 
@@ -187,6 +187,33 @@ esac
 BIN="${1:-$HOME/.local/bin}"
 need python3
 
+# ── carry a pre-rename install over (osync-dash → osd) ───────────────────────
+# Old systemd units keep firing under their own name and would run a launcher
+# that no longer exists, so they are retired here; osd rewrites them on next use.
+migrate_from_osync_dash() {
+  local ud="$HOME/.config/systemd/user" old=0
+  if command -v systemctl >/dev/null 2>&1 && compgen -G "$ud/osync-dash-*" >/dev/null; then
+    for u in "$ud"/osync-dash-*.timer; do
+      [ -e "$u" ] || continue
+      systemctl --user disable --now "$(basename "$u")" >/dev/null 2>&1 || true
+      old=1
+    done
+    rm -f "$ud"/osync-dash-*.service "$ud"/osync-dash-*.timer
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    [ "$old" = 1 ] && say "retired pre-rename systemd units (osd rewrites them)"
+  fi
+  [ -f "$HOME/.config/osync/osync-dash.toml" ] && [ ! -f "$HOME/.config/osync/osd.toml" ] &&
+    mv "$HOME/.config/osync/osync-dash.toml" "$HOME/.config/osync/osd.toml" &&
+    say "moved compose file to osd.toml"
+  for a in "$BIN/osync-dash" "$HOME/.local/bin/osync-dash"; do
+    [ -L "$a" ] && rm -f "$a" && say "removed old $a launcher"
+  done
+  [ -d "$HOME/.local/share/osync-dash" ] &&
+    say "note: the old prefix ~/.local/share/osync-dash can be deleted"
+  return 0
+}
+migrate_from_osync_dash
+
 vendor_osync
 
 say "creating virtualenv (.venv) for the Textual TUI"
@@ -195,15 +222,15 @@ python3 -m venv "$SRC/.venv"
 "$SRC/.venv/bin/pip" install --quiet "textual==$TEXTUAL_VERSION"
 
 mkdir -p "$BIN"
-ln -sfn "$SRC/osync-dash" "$BIN/osync-dash"
-say "linked $BIN/osync-dash -> $SRC/osync-dash"
+ln -sfn "$SRC/osd" "$BIN/osd"
+say "linked $BIN/osd -> $SRC/osd"
 ln -sfn "$SRC/yeet" "$BIN/yeet"
 say "linked $BIN/yeet -> $SRC/yeet"
 say "vendored osync: $("$OSYNC_DIR/osync.sh" --version 2>&1 | head -1)"
 echo
 echo "done. Ensure $BIN is on your PATH, then run:"
-echo "    osync-dash                        # the TUI"
-echo "    osync-dash --print                # one-shot render"
+echo "    osd                        # the TUI"
+echo "    osd --print                # one-shot render"
 echo "    yeet FILE / yeet                  # one-shot drops across the tailnet"
 echo "    $SRC/install.sh --remote user@host  # match osync on a replica"
 echo "    $SRC/install.sh --uninstall         # remove everything"

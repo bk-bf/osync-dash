@@ -1,8 +1,8 @@
 // Main.qml — the plugin's single data source and shared state.
 //
-// This addon reuses osync-dash itself as its backend: it runs
-// `osync-dash --json`, the stable machine-readable contract added to
-// osync_core.py for exactly this purpose. No probing, health logic or log
+// This addon reuses osd itself as its backend: it runs
+// `osd --json`, the stable machine-readable contract added to
+// osd_core.py for exactly this purpose. No probing, health logic or log
 // parsing is reimplemented here — the same gather()/health() code that powers
 // the TUI and `--print` produces this JSON.
 //
@@ -22,7 +22,7 @@ Item {
 
   // ── settings ────────────────────────────────────────────────────────────────
   readonly property var cfg: pluginApi ? pluginApi.pluginSettings : ({})
-  readonly property string binPath: String((cfg && cfg.binPath) || "osync-dash").trim()
+  readonly property string binPath: String((cfg && cfg.binPath) || "osd").trim()
   readonly property int intervalMs: Math.max(5000, (cfg && cfg.intervalMs) || 20000)
   readonly property bool localOnly: (cfg && cfg.localOnly !== undefined) ? cfg.localOnly : false
   readonly property string barMetric: (cfg && cfg.barMetric) || "auto"
@@ -306,12 +306,12 @@ Item {
     return lines.join("\n");
   }
 
-  // ── running osync-dash ──────────────────────────────────────────────────────
+  // ── running osd ──────────────────────────────────────────────────────
   function refresh() {
     if (loading || proc.running)
       return;
     if (!binPath) {
-      errorText = "no osync-dash path configured";
+      errorText = "no osd path configured";
       return;
     }
     loading = true;
@@ -328,7 +328,7 @@ Item {
       root.lastOkMs = Date.now();
     } catch (e) {
       root.errorText = "invalid JSON from " + root.binPath;
-      Logger.w("osync-dash", "parse failed:", e);
+      Logger.w("osd", "parse failed:", e);
     }
   }
 
@@ -354,7 +354,7 @@ Item {
 
   // ── liveness poll ───────────────────────────────────────────────────────────
   // osync's lock windows are only ~1.5s, so catching a sync needs ~1Hz polling.
-  // `osync-dash --status` would be correct but costs ~90ms of Python startup per
+  // `osd --status` would be correct but costs ~90ms of Python startup per
   // call — far too much to run every second forever. Instead we stat the lock
   // paths the core reported in `lock_file`, which is a couple of milliseconds and
   // keeps the path layout owned by the core rather than hardcoded here.
@@ -457,5 +457,5 @@ Item {
     onTriggered: root.tick++
   }
 
-  Component.onCompleted: Logger.i("osync-dash", "plugin started, running:", command)
+  Component.onCompleted: Logger.i("osd", "plugin started, running:", command)
 }

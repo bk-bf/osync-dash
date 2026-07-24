@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""osync-dash — Textual TUI front-end (ayu-themed, btop-inspired).
+"""osd — Textual TUI front-end (ayu-themed, btop-inspired).
 
-One compose file (~/.config/osync/osync-dash.toml) defines many sync
+One compose file (~/.config/osync/osd.toml) defines many sync
 connections; each is rendered as its own always-expanded card. Data gathering
-and compose management live in osync_core; this module is presentation only.
+and compose management live in osd_core; this module is presentation only.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-import osync_core as core  # noqa: E402
+import osd_core as core  # noqa: E402
 
 from rich.console import Group  # noqa: E402
 from rich.table import Table  # noqa: E402
@@ -937,7 +937,7 @@ class OsyncDash(App):
     def _load_compose(self):
         self.conns = core.load_all()
         node = core.parse_settings().get("node") or core.socket.gethostname()
-        self.title = f"osync-dash · {node}"   # this node's view of the mesh
+        self.title = f"osd · {node}"   # this node's view of the mesh
         n = len(self.conns)
         self.sub_title = f"{n} connection{'' if n == 1 else 's'}"
 

@@ -1,6 +1,6 @@
 # Noctalia plugin — osync
 
-A [Noctalia](https://noctalia.dev) bar widget that runs `osync-dash --json` and
+A [Noctalia](https://noctalia.dev) bar widget that runs `osd --json` and
 renders the result. It reimplements nothing — no probing, no health rules, no
 log parsing. The same `gather()` / `health()` code that powers the TUI and
 `--print` produces the JSON this plugin reads.
@@ -38,15 +38,15 @@ log parsing. The same `gather()` / `health()` code that powers the TUI and
 
 ## Dependency
 
-**This plugin requires osync-dash itself** — install the parent project first
-(repo root `install.sh`), which puts the launcher at `~/.local/bin/osync-dash`.
+**This plugin requires osd itself** — install the parent project first
+(repo root `install.sh`), which puts the launcher at `~/.local/bin/osd`.
 The plugin runs:
 
 ```sh
-osync-dash --json [--local-only]
+osd --json [--local-only]
 ```
 
-`--json` is a stable, additive contract in `osync_core.py`: stdlib only, no ANSI,
+`--json` is a stable, additive contract in `osd_core.py`: stdlib only, no ANSI,
 nothing but JSON on stdout. It runs the fast path — the probe, but never the
 `--check` dry-run — so polling it is cheap relative to a sync.
 
@@ -59,7 +59,7 @@ prints the failing command and stderr.
 ./install.sh
 ```
 
-Symlinks the directory into `~/.config/noctalia/plugins/osync-dash`, so the
+Symlinks the directory into `~/.config/noctalia/plugins/osd`, so the
 plugin lives in this repo and updates with it. Then:
 
 1. Noctalia → **Settings → Plugins → Installed** → enable **osync**.
@@ -86,7 +86,7 @@ configurable:
 | `changes` | Pending `↑push ↓pull` summed across connections |
 
 **Panel** — one card per connection, and it is a one-to-one port of the TUI's
-card (`card_body()` in `osync_tui.py`): same rows, same order, same wording,
+card (`card_body()` in `osd_tui.py`): same rows, same order, same wording,
 same semantic colours. Health badge and last-sync age; the `↑ push / ↓ pull`
 legs with the TUI's exact logic (`off` for the idle leg of a one-way sync,
 `N files` when hot, `in sync` at zero, braille spinner and `transferring…`
@@ -113,10 +113,10 @@ Three independent loops, so liveness never waits on the expensive probe:
 
 osync's lock windows are only ~1.5s wide, so a slow poll misses most syncs
 entirely — a 1-minute sync routine would finish between two probes. The fast
-loop stats the `lock_file` path the core reports (`osync-dash --json`), which
+loop stats the `lock_file` path the core reports (`osd --json`), which
 costs ~2ms, and **a start/stop transition immediately triggers a full probe** so
 the counts are right the moment a sync ends rather than up to an interval later.
-`osync-dash --status` does the same job for scripts, but pays ~90ms of Python
+`osd --status` does the same job for scripts, but pays ~90ms of Python
 startup per call.
 
 Relative ages are computed from `last_sync_ts` against the 1s tick, not from the
@@ -132,7 +132,7 @@ the lock file is local.
 
 | File | Role |
 |---|---|
-| `Main.qml` | Runs `osync-dash --json` on a timer, parses it, derives every display string. Bar and panel share it via `pluginApi.mainInstance`. |
+| `Main.qml` | Runs `osd --json` on a timer, parses it, derives every display string. Bar and panel share it via `pluginApi.mainInstance`. |
 | `BarWidget.qml` | The pill. Pure presentation. |
 | `Panel.qml` | Per-connection cards. |
 | `Settings.qml` | Binary path, interval, local-only, bar metric, terminal. |
