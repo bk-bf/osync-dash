@@ -262,12 +262,10 @@ Item {
     case "changes":
       return "↑" + pushChanges + " ↓" + pullChanges;
     default:
-      // auto — the dot carries the health, so the text is free to always show
-      // what is actually waiting to move in each direction.
-      if (anyOffline)
-        return "offline";
-      if (anyRunning)
-        return "syncing";
+      // auto — always the pending counts, never a word. The icon already says
+      // running (spinner) and unreachable (red), and swapping the label between
+      // "syncing"/"offline"/counts resizes the pill, which shoves every widget
+      // beside it along the bar. The label keeps one shape so the bar stays put.
       return "↑" + pushChanges + " ↓" + pullChanges;
     }
   }

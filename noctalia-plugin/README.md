@@ -71,14 +71,16 @@ Remove with `./install.sh --uninstall`.
 
 ## What it shows
 
-**Bar pill** — a status dot on the left, counts to its right. The dot is the
-signal: **green** when healthy, **green and spinning** while a sync is actually
-running, **red** when a replica is unreachable, amber for a stale/errored job.
-The label is configurable:
+**Bar pill** — a status dot on the left, counts to its right. The dot carries
+every state change: **green** when healthy, **green and spinning** while a sync
+is actually running, **red** when a replica is unreachable, amber for a
+stale/errored job. The label deliberately never changes shape, because a pill
+that resizes drags every widget next to it along the bar. The label is
+configurable:
 
 | Mode | Shows |
 |---|---|
-| `auto` (default) | Pending `↑push ↓pull`, or `syncing` / `offline` when either applies |
+| `auto` (default) | Pending `↑push ↓pull`, always — the label never swaps to a word, so the pill keeps a constant width and nothing beside it shifts |
 | `health` | Worst health across all connections |
 | `counts` | `healthy / total` |
 | `changes` | Pending `↑push ↓pull` summed across connections |
