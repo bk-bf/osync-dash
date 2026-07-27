@@ -39,9 +39,11 @@ Options:
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -245,20 +247,60 @@ def resolve_ssh_host(host: str) -> str | None:
     return None
 
 
-def probe_local(sync_dir: Path, baseline=None) -> dict:
+# ── exclude patterns ─────────────────────────────────────────────────────────
+# The probes below must skip exactly what osync skips. Counting an excluded file
+# as a pending change is not just cosmetic: the badge can never drain, because
+# only a real osync run advances the baseline (guarded_sync short-circuits on the
+# dry-run, which *does* honour excludes), and an excluded file never causes one.
+# A .git commit would otherwise pin "↑12 to push" forever with nothing to push.
+
+def parse_excludes(cfg: dict) -> list[str]:
+    """RSYNC_EXCLUDE_PATTERN as a list, split on the config's separator char."""
+    sep = (cfg.get("PATH_SEPARATOR_CHAR") or ";") or ";"
+    raw = (cfg.get("RSYNC_EXCLUDE_PATTERN") or "").strip()
+    return [p for p in (x.strip() for x in raw.split(sep)) if p]
+
+
+def is_excluded(rel: str, name: str, pats: list[str]) -> bool:
+    """rsync exclude semantics for one path. A pattern with no '/' matches a
+    basename at any depth (so it prunes a whole directory); one with a '/'
+    matches `rel` (the path relative to the sync root), anchored if it starts
+    with '/'. A trailing '/' — rsync's directory-only marker — is tolerated."""
+    for p in pats:
+        q = p.rstrip("/")
+        if not q:
+            continue
+        if "/" in q:
+            cands = [q[1:]] if q.startswith("/") else [q, "*/" + q]
+            if any(fnmatch.fnmatch(rel, c) for c in cands):
+                return True
+        elif fnmatch.fnmatch(name, q):
+            return True
+    return False
+
+
+def probe_local(sync_dir: Path, baseline=None, excludes=None) -> dict:
     d = {"reach": sync_dir.is_dir(), "rsync": bool(shutil.which("rsync")),
          "host": socket.gethostname()}
     if not d["reach"]:
         return d
+    pats = excludes or []
     files = size = changed = 0
     newest = 0.0
     for root, dirs, fs in os.walk(sync_dir):
         if OSYNC_DIR in Path(root).parts:
             dirs[:] = [x for x in dirs if x != OSYNC_DIR]
             continue
-        if OSYNC_DIR in dirs:
-            dirs.remove(OSYNC_DIR)
+        rroot = os.path.relpath(root, sync_dir)
+        rroot = "" if rroot == "." else rroot
+        # prune in-place so excluded trees are never descended into — every
+        # count below then describes the set that actually syncs, and we stop
+        # stat()ing the hundreds of loose objects under a .git on every refresh
+        dirs[:] = [x for x in dirs if x != OSYNC_DIR
+                   and not is_excluded(f"{rroot}/{x}".lstrip("/"), x, pats)]
         for f in fs:
+            if is_excluded(f"{rroot}/{f}".lstrip("/"), f, pats):
+                continue
             fp = Path(root) / f
             try:
                 stt = fp.stat()
@@ -294,20 +336,37 @@ def probe_local(sync_dir: Path, baseline=None) -> dict:
     return d
 
 
+def _find_prune(pats: list[str]) -> str:
+    """The same exclude set as is_excluded(), as a find(1) prune clause. Pruning
+    (rather than filtering with -not -path) is what makes an excluded directory
+    exclude its whole subtree, and keeps find out of it entirely."""
+    terms = ["-name " + shlex.quote(OSYNC_DIR)]
+    for p in pats:
+        q = p.rstrip("/")
+        if not q:
+            continue
+        if "/" in q:
+            cands = [q[1:]] if q.startswith("/") else [q, "*/" + q]
+            terms += ['-path "$p"/' + shlex.quote(c) for c in cands]
+        else:
+            terms.append("-name " + shlex.quote(q))
+    return " -o ".join(terms)
+
+
 REMOTE_PROBE = r'''
-p=%s
-b=%s
+p=%(path)s
+b=%(base)s
 echo "REACH=1"
 command -v rsync >/dev/null && echo "RSYNC=1" || echo "RSYNC=0"
 echo "HOST=$(hostname 2>/dev/null)"
 if [ -d "$p" ]; then
-  echo "FILES=$(find "$p" -type f -not -path '*/.osync_workdir/*' 2>/dev/null | wc -l)"
-  echo "SIZE=$(du -sb "$p" --exclude=.osync_workdir 2>/dev/null | cut -f1)"
+  find "$p" \( %(prune)s \) -prune -o -type f -printf '%%s\n' 2>/dev/null |
+    awk '{n++; s+=$1} END {print "FILES=" n+0; print "SIZE=" s+0}'
   df -PB1 "$p" 2>/dev/null | awk 'NR==2{print "DISK_TOTAL="$2"\nDISK_USED="$3"\nFREE="$4}'
   echo "DELETED=$(find "$p/.osync_workdir/deleted" -type f 2>/dev/null | wc -l)"
   echo "BACKUP=$(find "$p/.osync_workdir/backup" -type f 2>/dev/null | wc -l)"
   if [ -n "$b" ]; then
-    echo "CHANGED=$(find "$p" -type f -not -path '*/.osync_workdir/*' -newermt @"$b" 2>/dev/null | wc -l)"
+    echo "CHANGED=$(find "$p" \( %(prune)s \) -prune -o -type f -newermt @"$b" -print 2>/dev/null | wc -l)"
   fi
   echo "DIR=1"
 else
@@ -316,10 +375,13 @@ fi
 '''
 
 
-def probe_remote(cfg: dict, tgt: dict, baseline=None) -> dict:
-    import shlex
-    script = REMOTE_PROBE % (shlex.quote(tgt["path"]),
-                             shlex.quote(str(int(baseline)) if baseline else ""))
+def probe_remote(cfg: dict, tgt: dict, baseline=None, excludes=None) -> dict:
+    pats = parse_excludes(cfg) if excludes is None else excludes
+    script = REMOTE_PROBE % {
+        "path": shlex.quote(tgt["path"]),
+        "base": shlex.quote(str(int(baseline)) if baseline else ""),
+        "prune": _find_prune(pats),
+    }
     rc, out = run(ssh_prefix(cfg, tgt) + [script], timeout=20)
     if rc != 0:
         return {"reach": False, "err": out.strip().splitlines()[-1] if out.strip() else "unreachable"}
@@ -1559,14 +1621,17 @@ def gather(cfg, tgt, local_only=False):
     # anything with a newer mtime is a live change waiting to sync (git-style).
     inst = cfg.get("INSTANCE_ID", "")
     baseline = _state_mtime(sync_dir / OSYNC_DIR / "state" / f"initiator-last-action-{inst}")
-    local = probe_local(sync_dir, baseline)
+    # both replicas are probed through osync's own exclude list, so the counts
+    # describe the synced set — not files rsync was never going to touch
+    excludes = parse_excludes(cfg)
+    local = probe_local(sync_dir, baseline, excludes)
     remote = {"reach": False, "err": "skipped"}
     if tgt.get("remote") and not local_only:
         user = tgt.get("user", "")
         path = tgt.get("path", "")
         last = None
         for which, host, port in endpoints(cfg):
-            r = probe_remote(cfg, {**tgt, "host": host, "port": port}, baseline)
+            r = probe_remote(cfg, {**tgt, "host": host, "port": port}, baseline, excludes)
             last = r
             if r.get("reach"):
                 r["endpoint_used"] = which

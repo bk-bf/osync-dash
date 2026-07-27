@@ -442,6 +442,12 @@ osd --local-only     # offline: skip the remote probe
 | free space | `statvfs` locally, `df` remotely |
 | safety net | file counts under `.osync_workdir/{deleted,backup}` on both sides |
 | ↑push/↓pull (live) | files changed since the last sync — local mtime walk + remote `find -newermt` |
+
+Both probes apply `RSYNC_EXCLUDE_PATTERN`, so every count above describes the
+set that actually syncs. Without that, an excluded path shows as a change that
+can never clear: only a real osync run advances the `last-action` baseline, the
+scheduler skips that run precisely because the dry-run finds nothing to send,
+and so a `.git` commit inside the tree would pin `↑12` on the bar forever.
 | moved (last run) | osync's own log, parsed for the last completed run's updates/deletions per direction (reliable thanks to the pinned osync) |
 | pending (exact) | `osync … --dry --summary` on demand (`c`), for exact updates + deletions |
 
