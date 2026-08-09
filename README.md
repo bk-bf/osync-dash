@@ -123,10 +123,11 @@ click-through panel showing every connection. It reimplements nothing — same
 probing, same health rules.
 
 ```sh
-cd noctalia-plugin && ./install.sh
+./install.sh --with-noctalia      # or: cd noctalia-plugin && ./install.sh
 ```
 
-Entirely optional — nothing else in this project depends on it. See
+Entirely optional — nothing else in this project depends on it, and the main
+installer leaves it out unless asked. See
 [`noctalia-plugin/README.md`](noctalia-plugin/README.md).
 
 ## Requirements
@@ -158,6 +159,29 @@ The installer:
 Re-run any time — it's idempotent. `install.sh [BINDIR]` links elsewhere. From a
 clone, `./install.sh` works the same. `--print` still runs on the system Python
 (stdlib only) even without the venv.
+
+### Desktop extras (opt-in)
+
+osd installs the same way on a headless server as on a desktop, so anything that
+assumes a graphical session — or that would start syncing files on its own — sits
+behind a flag:
+
+| flag | |
+|---|---|
+| `--with-units` | write the [auto-sync](#auto-sync-off--on-change--periodic) systemd `--user` units for every connection configured for one. Written and reloaded, **not** started. |
+| `--enable-units` | the same, and then `enable --now` them. |
+| `--with-noctalia` | link the [Noctalia bar plugin](#noctalia-plugin-optional). |
+
+```sh
+./install.sh --with-units --with-noctalia
+```
+
+The units are **generated** from your compose file, never shipped: which units
+exist, what they are called and every path inside them follow from the
+connections this machine has configured and from where this checkout lives. A
+clone in a different directory, or a machine that syncs a different set of
+folders, still ends up with units that work. `osd --install-units [--enable]`
+does the same thing later without re-running the installer.
 
 ### Version pinning & replicas
 
@@ -402,6 +426,24 @@ ok`, or a red `⚠ last run failed` you can jump into with `l`. Units are
 `osd-<name>.{service,timer}` under `~/.config/systemd/user/`, and survive
 logout/reboot when user lingering is on (`loginctl enable-linger $USER`).
 
+Each service also gets a `50-background.conf` drop-in putting it in
+`background.slice` with a raised OOM score: a sync yields to the compositor and
+the browser under contention, and under memory pressure the kernel reaps the
+sync rather than the desktop session. There is deliberately no `MemoryMax` — a
+hard cap turns a large but legitimate sync into a kill.
+
+On a **new machine** the compose file arrives with `auto` already set per
+connection, but the units themselves do not exist yet. Write them without
+opening the TUI:
+
+```sh
+osd --install-units             # write + daemon-reload, start nothing
+osd --install-units --enable    # …and enable --now each one
+```
+
+`install.sh --with-units` / `--enable-units` run exactly this as part of an
+install.
+
 **Scheduled and continuous syncs run through the deletion guard** (below), so an
 unattended sync can't quietly mirror a mass-delete.
 
@@ -429,6 +471,7 @@ osd --print --fast    # skip the pending dry-run
 osd --sync           # run the sync, print the result, exit
 osd --log            # page the osync log, exit
 osd --local-only     # offline: skip the remote probe
+osd --install-units  # write the auto-sync systemd units (--enable to start)
 ```
 
 ## How it reads status

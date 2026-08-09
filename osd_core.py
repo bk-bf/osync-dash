@@ -34,6 +34,11 @@ Options:
         --json          Emit every connection as machine-readable JSON on stdout
                         and exit (stable schema; consumed by the Noctalia plugin
                         and other integrations). Nothing else is printed.
+        --install-units Write the systemd --user units for every connection
+                        whose compose entry asks for automatic sync, then exit.
+                        Generates them from the compose file and this checkout's
+                        location, so nothing is hardcoded. Installs only; add
+                        --enable to also enable and start them.
     -U, --update        Pull the latest source and re-run the installer.
     -h, --help          This help.
 """
@@ -1261,6 +1266,33 @@ Persistent=true
 WantedBy=timers.target
 """
 
+# Drop-in rather than part of the service body so it stays one block to reason
+# about, and so a machine that wants different resource policy can override it
+# with a higher-numbered file instead of patching a generated unit.
+_DROPIN = """\
+# Batch work — yields to the desktop under contention.
+#
+# background.slice carries systemd's default CPUWeight=30 against 100 elsewhere,
+# so a sync gives way when the compositor, a browser or an interactive terminal
+# wants the CPU. Weights bind only under contention: on an idle machine the sync
+# still runs at full speed, and no sync is latency-sensitive enough to care.
+#
+# OOMScoreAdjust is the load-bearing line — under real memory pressure the
+# kernel reaps the sync long before it reaches the graphical session, which is
+# what stops a big pass from taking the desktop down with it. There is
+# deliberately no MemoryMax: a hard cap turns a large but legitimate sync into a
+# kill, and the OOM score already picks this process first when it matters.
+[Service]
+Slice=background.slice
+Nice=15
+CPUWeight=20
+IOWeight=20
+OOMScoreAdjust=800
+# A full pass over a large tree outlives systemd's 90s default start timeout,
+# and a oneshot that trips it is killed mid-sync.
+TimeoutStartSec=3600
+"""
+
 
 _DUR_SECS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
 _DUR_SYS = {"m": "min", "h": "h", "d": "d", "w": "w"}  # systemd time-span units
@@ -1314,30 +1346,51 @@ def auto_mode(conn: dict) -> str:
     return m if m in AUTO_MODES else "off"
 
 
-def _write_units(name: str, mode: str, interval, conf: str, calendar: str = "") -> None:
+def render_units(name: str, mode: str, interval, conf: str,
+                 calendar: str = "") -> list[Path]:
+    """Write one connection's unit files and return what was written.
+
+    Pure filesystem — no systemctl, nothing enabled, nothing started. Both the
+    TUI (which then enables) and the installer (which deliberately does not)
+    go through here, so a unit looks the same however it arrived.
+    """
     base = _unit_base(name)
     svc, tmr = SYSTEMD_USER_DIR / f"{base}.service", SYSTEMD_USER_DIR / f"{base}.timer"
-    # tear the old pair down first, whatever it was
-    _systemctl("disable", "--now", f"{base}.timer")
-    _systemctl("disable", "--now", f"{base}.service")
+    dropin = SYSTEMD_USER_DIR / f"{base}.service.d" / "50-background.conf"
     for f in (svc, tmr):
         if f.exists():
             f.unlink()
+    if mode == "off":
+        shutil.rmtree(dropin.parent, ignore_errors=True)
+        return []
     SYSTEMD_USER_DIR.mkdir(parents=True, exist_ok=True)
+    written = [svc]
     if mode == "change":
         svc.write_text(_SVC_CHANGE.format(name=name, osync=OSYNC_BIN, conf=conf))
-        _systemctl("daemon-reload")
-        _systemctl("enable", "--now", f"{base}.service")
-    elif mode == "periodic":
+    else:
         svc.write_text(_SVC_ONESHOT.format(name=name, launcher=LAUNCHER))
         if calendar:
             tmr.write_text(_TIMER_CAL.format(name=name, calendar=calendar))
         else:
             tmr.write_text(_TIMER.format(name=name, interval=parse_duration(interval)["systemd"]))
-        _systemctl("daemon-reload")
+        written.append(tmr)
+    dropin.parent.mkdir(parents=True, exist_ok=True)
+    dropin.write_text(_DROPIN)
+    written.append(dropin)
+    return written
+
+
+def _write_units(name: str, mode: str, interval, conf: str, calendar: str = "") -> None:
+    base = _unit_base(name)
+    # tear the old pair down first, whatever it was
+    _systemctl("disable", "--now", f"{base}.timer")
+    _systemctl("disable", "--now", f"{base}.service")
+    render_units(name, mode, interval, conf, calendar=calendar)
+    _systemctl("daemon-reload")
+    if mode == "change":
+        _systemctl("enable", "--now", f"{base}.service")
+    elif mode == "periodic":
         _systemctl("enable", "--now", f"{base}.timer")
-    else:
-        _systemctl("daemon-reload")
 
 
 def set_auto(name: str, mode: str, interval=None, calendar: str | None = None) -> tuple[str, str]:
@@ -1383,6 +1436,60 @@ def cycle_auto(name: str) -> tuple[str, str]:
         return "off", "connection not found"
     cur = auto_mode(conn)
     return set_auto(name, AUTO_MODES[(AUTO_MODES.index(cur) + 1) % len(AUTO_MODES)])
+
+
+def install_units(enable: bool = False) -> int:
+    """`osd --install-units` — materialise the units for every connection whose
+    compose entry already asks for automatic sync.
+
+    The units are generated from the compose file, never shipped: which ones
+    exist and what they are called follows from the connections *this* machine
+    has configured, and every path in them is resolved here rather than baked
+    into a file in the repo. That is the whole point — a checkout in a different
+    directory, or a machine with a different set of connections, still ends up
+    with units that work.
+
+    Writing a unit is not turning it on. `enable` is opt-in and off by default,
+    because installing software should not start syncing someone's files.
+    """
+    defaults, conns = parse_compose()
+    wanted = [c for c in conns if auto_mode(c) != "off"]
+    if not conns:
+        print("osd: no compose file yet — units are generated from your "
+              "connections, so add one first (run osd, press 'a').")
+        return 0
+    if not wanted:
+        print("osd: no connection has auto-sync configured — nothing to "
+              "install. Set it per connection in the TUI ('A').")
+        return 0
+    if not have_systemd():
+        sys.stderr.write("osd: no systemctl on this machine — skipping units\n")
+        return 0
+
+    for conn in wanted:
+        name = conn["name"]
+        mode = auto_mode(conn)
+        # only the on-change daemon runs osync directly and so needs a .conf on
+        # disk; a periodic unit calls the launcher, which materialises its own.
+        conf = str(materialize(conn, defaults)) if mode == "change" else ""
+        for p in render_units(name, mode, conn.get("interval", "15m"), conf,
+                              calendar=conn.get("at", "")):
+            print(f"→ wrote {p}")
+    _systemctl("daemon-reload")
+
+    if not enable:
+        names = " ".join(f"{_unit_base(c['name'])}."
+                         f"{'service' if auto_mode(c) == 'change' else 'timer'}"
+                         for c in wanted)
+        print("\nInstalled, not started. Turn them on with:\n"
+              f"    systemctl --user enable --now {names}")
+        return 0
+    for conn in wanted:
+        base = _unit_base(conn["name"])
+        unit = f"{base}.service" if auto_mode(conn) == "change" else f"{base}.timer"
+        rc, out = _systemctl("enable", "--now", unit)
+        print(f"→ enabled {unit}" if rc == 0 else f"! {unit}: {out.strip()}")
+    return 0
 
 
 _SPAN_UNITS = {"us": 1e-6, "ms": 1e-3, "s": 1, "sec": 1, "seconds": 1,
@@ -1799,6 +1906,11 @@ def emit_json(conns, local_only: bool) -> None:
 
 def main():
     args = sys.argv[1:]
+    # Taken before the option loop: the installer calls this on a machine that
+    # may have no connections at all, where the loop's "no connections" exit
+    # would be an error rather than the answer.
+    if "--install-units" in args:
+        sys.exit(install_units(enable="--enable" in args))
     o = {"config": None, "watch": False, "interval": 6, "check": False,
          "sync": False, "log": False, "local_only": False, "fast": False,
          "print": False, "json": False, "status": False}

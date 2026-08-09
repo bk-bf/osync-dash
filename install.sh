@@ -8,11 +8,20 @@
 #
 # Usage:
 #   install.sh [BINDIR]                 install here (BINDIR defaults to ~/.local/bin)
+#   install.sh --with-units             also write the systemd --user units for
+#                                       every connection set to auto-sync
+#                                       (written, not started)
+#   install.sh --enable-units           …and enable + start them
+#   install.sh --with-noctalia          also link the Noctalia bar plugin
 #   install.sh --remote user@host       copy the pinned osync onto a remote replica
 #   install.sh --print-osync            print the path to the vendored osync.sh
 #   install.sh --uninstall [--yes]      remove osd, its osync, units, and
 #                                       every setup it created on this machine
 #   install.sh --uninstall --purge-remote   also wipe .osync_workdir on replicas
+#
+# The desktop extras are opt-in: osd is just as much a headless-server tool, and
+# a server has no bar to put a plugin on and no business starting a sync it was
+# never asked to start.
 #
 # Env: OSD_HOME (default ~/.local/share/osd), OSD_REPO.
 set -euo pipefail
@@ -84,9 +93,14 @@ PY
     done
     rm -f "$HOME/.config/systemd/user/"osd-*.service \
           "$HOME/.config/systemd/user/"osd-*.timer 2>/dev/null || true
+    rm -rf "$HOME/.config/systemd/user/"osd-*.service.d 2>/dev/null || true
     systemctl --user daemon-reload >/dev/null 2>&1 || true
     say "removed systemd units"
   fi
+
+  # 1b. the Noctalia plugin link (only ever a symlink into this repo)
+  a="${XDG_CONFIG_HOME:-$HOME/.config}/noctalia/plugins/osd"
+  [ -L "$a" ] && rm -f "$a" && say "unlinked the Noctalia plugin"
 
   # 2. .osync_workdir in the synced dirs (local always; remote if asked)
   if [ -n "$conns" ]; then
@@ -184,7 +198,19 @@ case "${1:-}" in
   --print-osync)   vendor_osync >&2; printf '%s\n' "$OSYNC_DIR/osync.sh"; exit 0 ;;
 esac
 
-BIN="${1:-$HOME/.local/bin}"
+# Flags and the optional BINDIR come in any order; the desktop extras default
+# off so `install.sh` alone stays the headless install.
+BIN=""; WITH_UNITS=0; ENABLE_UNITS=0; WITH_NOCTALIA=0
+for a in "$@"; do
+  case "$a" in
+    --with-units)    WITH_UNITS=1 ;;
+    --enable-units)  WITH_UNITS=1; ENABLE_UNITS=1 ;;
+    --with-noctalia) WITH_NOCTALIA=1 ;;
+    -*)              die "unknown flag: $a (see the header of this script)" ;;
+    *)               [ -n "$BIN" ] && die "unexpected argument: $a"; BIN="$a" ;;
+  esac
+done
+BIN="${BIN:-$HOME/.local/bin}"
 need python3
 
 # ── carry a pre-rename install over (osync-dash → osd) ───────────────────────
@@ -235,10 +261,30 @@ say "linked $BIN/osd -> $SRC/osd"
 ln -sfn "$SRC/yeet" "$BIN/yeet"
 say "linked $BIN/yeet -> $SRC/yeet"
 say "vendored osync: $("$OSYNC_DIR/osync.sh" --version 2>&1 | head -1)"
+
+# ── optional: systemd --user units ───────────────────────────────────────────
+# osd generates these from the compose file rather than shipping them, so the
+# set of units, their names and every path inside them follow from the
+# connections this machine has configured and from where this checkout lives.
+if [ "$WITH_UNITS" = 1 ]; then
+  if [ "$ENABLE_UNITS" = 1 ]; then
+    "$SRC/osd" --install-units --enable
+  else
+    "$SRC/osd" --install-units
+  fi
+fi
+
+# ── optional: the Noctalia bar plugin ────────────────────────────────────────
+if [ "$WITH_NOCTALIA" = 1 ]; then
+  bash "$SRC/noctalia-plugin/install.sh"
+fi
+
 echo
 echo "done. Ensure $BIN is on your PATH, then run:"
 echo "    osd                        # the TUI"
 echo "    osd --print                # one-shot render"
 echo "    yeet FILE  /  yeet         # one-shot drops across the mesh"
+echo "    $SRC/install.sh --with-units        # write the auto-sync units"
+echo "    $SRC/install.sh --with-noctalia     # link the Noctalia bar plugin"
 echo "    $SRC/install.sh --remote user@host  # match osync on a replica"
 echo "    $SRC/install.sh --uninstall         # remove everything"
