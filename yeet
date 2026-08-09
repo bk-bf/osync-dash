@@ -119,7 +119,12 @@ def hub_run(hub: dict, script: str, stdin: str | None = None,
             timeout: int = 30) -> tuple[int, str]:
     # Spool paths are written relative to the hub user's home, which is where an
     # ssh command lands — so a local run has to be put there deliberately.
-    cmd = ["sh", "-c", script] if hub["local"] else ssh_cmd(hub) + [script]
+    # The remote script runs under the hub user's LOGIN shell, and zsh's
+    # nomatch turns an unmatched glob into a hard error where sh passes the
+    # pattern through — which the drop-listing below reads as "nothing
+    # waiting". Force sh on both paths so the hub's shell cannot change it.
+    cmd = (["sh", "-c", script] if hub["local"]
+           else ssh_cmd(hub) + ["sh -c " + shlex.quote(script)])
     try:
         p = subprocess.run(cmd, input=stdin, text=True, capture_output=True,
                            timeout=timeout,
