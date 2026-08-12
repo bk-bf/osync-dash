@@ -463,12 +463,38 @@ they travel with your config and stay portable across machines:
   disaster where an empty or unmounted replica deletes everything on the other
   side.
 
+  **Moved files don't count.** A renamed directory looks like a mass delete to
+  osync, which compares paths rather than content — rename one folder and the
+  guard would block a sync that loses nothing. So when a sync is about to be
+  blocked, osd indexes both trees and pairs each departing path against
+  surviving content; only what it can't find elsewhere counts as a deletion.
+  Each surviving copy accounts for one departure, osync's own count stays the
+  ceiling, and a tree it can't read credits nothing — so the guard never gets
+  looser than it looks.
+
+  ```sh
+  osd --deletions claude-sessions-laptop
+  ```
+  ```
+  claude-sessions-laptop  guard 25
+    pending deletions   222
+    moved               204   same content, new path — costs nothing
+    real                18
+    verdict             allowed
+  ```
+
+  That is the command to reach for when a unit exits **3**. Raising
+  `delete_guard` to make the error go away removes the protection instead of
+  the problem.
+
 ### Non-interactive
 
 ```sh
 osd --print          # one-shot render to stdout (automatic when piped)
 osd --print --fast    # skip the pending dry-run
 osd --sync           # run the sync, print the result, exit
+osd --deletions NAME # split pending deletions into moves vs. real, and why
+                     # the guard would allow or block them
 osd --log            # page the osync log, exit
 osd --local-only     # offline: skip the remote probe
 osd --install-units  # write the auto-sync systemd units (--enable to start)

@@ -27,6 +27,11 @@ Options:
         --sync          Run the sync now (streams osync output), print the
                         result, exit. Extra args after -- are passed to osync.
         --log           Page the full osync log (less), then exit.
+        --deletions NAME
+                        Explain what a sync would delete, split into moved
+                        files (same content under a new path) and real
+                        deletions — the terms the delete guard judges by.
+                        Read this before touching delete_guard after an exit 3.
         --local-only    Skip the remote ssh probe (offline / fast).
         --no-color      Disable ANSI colour (--print mode).
         --status        Liveness only (is a sync running?) as JSON. One lock-file
@@ -1173,6 +1178,170 @@ def pending_deletions(pending: dict | None) -> int:
     return 0 if not pending else int(pending.get("id", 0)) + int(pending.get("td", 0))
 
 
+# ── moves vs deletions ───────────────────────────────────────────────────────
+# osync compares paths, so a renamed directory reads as "everything under the
+# old path was deleted" and the guard blocks a sync that loses nothing. This
+# bites anything keying storage by absolute path — Claude Code slugs sessions
+# as ~/.claude/projects/<abs-path>, so moving a project re-slugs its history.
+#
+# A deletion only deletes if the *content* goes away. Identity here is
+# (basename, size): strong enough to pair a session file with its moved twin,
+# cheap enough to compute without hashing a tree over ssh. Content still
+# present on the surviving side outlives the sync, so dropping the stale path
+# costs nothing — that is a move, and it must not spend the guard's budget.
+
+# Directories carry DIR_SIZE instead of a byte count so they pair only with
+# other directories — osync counts a vanished directory as a deletion too, and
+# one emptied by a rename is no more a loss than the files that left it.
+DIR_SIZE = -1
+
+REMOTE_TREE = r'''
+p=%(path)s
+[ -d "$p" ] || exit 9
+find "$p" \( %(prune)s \) -prune -o -type f -printf '%%s\t%%P\n' \
+                          -o -type d -printf '%(dir)s\t%%P\n' 2>/dev/null
+'''
+
+
+def _parse_tree(text: str) -> dict[str, int]:
+    r"""`size\tpath` lines -> {path: size}. Size leads so a path containing a tab
+    still round-trips (split on the first separator, never the last)."""
+    idx = {}
+    for line in text.splitlines():
+        size, sep, rel = line.partition("\t")
+        if sep and rel:
+            try:
+                idx[rel] = int(size)
+            except ValueError:
+                pass
+    return idx
+
+
+def tree_local(root: Path, pats: list[str]) -> dict[str, int]:
+    """{path relative to root: size} over the set that actually syncs. Same
+    in-place prune as probe_local, so an excluded tree is never descended."""
+    idx = {}
+    for dirpath, dirs, files in os.walk(root):
+        rroot = os.path.relpath(dirpath, root)
+        rroot = "" if rroot == "." else rroot
+        dirs[:] = [d for d in dirs if d != OSYNC_DIR
+                   and not is_excluded(f"{rroot}/{d}".lstrip("/"), d, pats)]
+        if rroot:
+            idx[rroot] = DIR_SIZE
+        for f in files:
+            rel = f"{rroot}/{f}".lstrip("/")
+            if is_excluded(rel, f, pats):
+                continue
+            try:
+                idx[rel] = (Path(dirpath) / f).stat().st_size
+            except OSError:
+                pass
+    return idx
+
+
+def tree_remote(cfg: dict, tgt: dict, pats: list[str]) -> dict[str, int] | None:
+    """The target's file index, or None if it couldn't be read — the caller must
+    treat that as 'no moves proven', never as 'nothing was moved'."""
+    if not tgt.get("remote"):
+        p = Path(tgt.get("path", ""))
+        return tree_local(p, pats) if p.is_dir() else None
+    script = REMOTE_TREE % {"path": shlex.quote(tgt["path"]),
+                            "prune": _find_prune(pats), "dir": DIR_SIZE}
+    rc, out = run(ssh_prefix(cfg, tgt) + [script], timeout=60)
+    return _parse_tree(out) if rc == 0 else None
+
+
+def classify_departures(doomed: dict[str, int],
+                        surviving: dict[str, int]) -> tuple[int, list[str]]:
+    """Split paths about to disappear into (moved count, still-really-deleted).
+
+    A departure is credited as a move when the surviving side still holds its
+    (basename, size) — but each surviving copy vouches for exactly one
+    departure. Without that cap a single leftover empty file would excuse
+    deleting a hundred of its namesakes, which is the one way this heuristic
+    could hide real loss."""
+    pool: dict[tuple[str, int], int] = {}
+    for path, size in surviving.items():
+        k = (os.path.basename(path), size)
+        pool[k] = pool.get(k, 0) + 1
+    moved, real = 0, []
+    for path in sorted(doomed):
+        k = (os.path.basename(path), doomed[path])
+        if pool.get(k, 0) > 0:
+            pool[k] -= 1
+            moved += 1
+        else:
+            real.append(path)
+    return moved, real
+
+
+def analyse_deletions(cfg: dict, tgt: dict, pending: dict) -> dict:
+    """Explain osync's pending deletion count: how many are relocations and how
+    many are real. osync's own numbers stay authoritative — this only ever
+    subtracts moves we can positively pair, per side and capped by that side's
+    reported count, so anything unexplained still counts as a deletion."""
+    total = pending_deletions(pending)
+    out = {"total": total, "moved": 0, "real": total, "proven": False,
+           "examples": []}
+    pats = parse_excludes(cfg)
+    src = tree_local(Path(cfg.get("INITIATOR_SYNC_DIR", "")), pats)
+    dst = tree_remote(cfg, tgt, pats)
+    if dst is None:
+        return out  # unreadable target: prove nothing, guard stays as strict
+    moved = 0
+    # Each side separately: a target path missing from the initiator is only a
+    # deletion if osync says the target loses files at all (a send job never
+    # deletes on the initiator, so its id is 0 and that side credits nothing).
+    for doomed_side, surviving_side, reported in (
+            ({p: s for p, s in dst.items() if p not in src}, src, int(pending.get("td", 0))),
+            ({p: s for p, s in src.items() if p not in dst}, dst, int(pending.get("id", 0)))):
+        if reported <= 0:
+            continue
+        m, real = classify_departures(doomed_side, surviving_side)
+        moved += min(m, reported)
+        out["examples"] += real[:5]
+    out["moved"] = min(moved, total)
+    out["real"] = max(0, total - out["moved"])
+    out["proven"] = True
+    return out
+
+
+def report_deletions(name: str) -> int:
+    """`--deletions NAME` — why a sync is (or isn't) blocked, in the terms the
+    guard actually judges by. The answer to an exit 3 is usually here: raising
+    delete_guard and bypassing it are both ways of destroying what it protects."""
+    defaults, conns = parse_compose()
+    conn = next((c for c in conns if c.get("name") == name), None)
+    if not conn:
+        sys.stderr.write(f"osd: no connection '{name}'\n")
+        return 2
+    cfg, tgt = connection_to_cfg(conn, defaults)
+    print(f"{GREY}dry run + tree comparison…{RESET}", flush=True)
+    pend = compute_pending(cfg["_configfile"])
+    if pend is None:
+        sys.exit(f"osd: could not dry-run {name} (target unreachable?)")
+    guard = int(parse_settings().get("delete_guard", 0) or 0)
+    an = analyse_deletions(cfg, tgt, pend)
+    print(f"\n{BOLD}{name}{RESET}  guard {guard}")
+    print(f"  pending deletions   {an['total']}")
+    if not an["proven"]:
+        print(f"  {YELLOW}tree unreadable — every one counts as a deletion{RESET}")
+    else:
+        print(f"  moved               {an['moved']}   "
+              f"{GREY}same content, new path — costs nothing{RESET}")
+        print(f"  real                {an['real']}")
+    verdict = (f"{GREEN}allowed{RESET}" if not guard or an["real"] <= guard
+               else f"{RED}blocked (exit 3){RESET}")
+    print(f"  verdict             {verdict}")
+    if an["examples"]:
+        print(f"\n  {BOLD}really going:{RESET}")
+        for p in an["examples"][:10]:
+            print(f"    {p}")
+        if an["real"] > len(an["examples"][:10]):
+            print(f"    {GREY}… and {an['real'] - len(an['examples'][:10])} more{RESET}")
+    return 0
+
+
 def guarded_sync(name: str) -> int:
     """Run one sync for `name` — but first do a dry-run to (a) skip the real
     sync entirely when nothing has changed, so a periodic timer doesn't spin up
@@ -1185,7 +1354,7 @@ def guarded_sync(name: str) -> int:
     if not conn:
         sys.stderr.write(f"osd: no connection '{name}'\n")
         return 2
-    cfg, _ = connection_to_cfg(conn, defaults)
+    cfg, tgt = connection_to_cfg(conn, defaults)
     pend = compute_pending(cfg["_configfile"])
     # in sync → don't do the work. (pend is None when the dry-run couldn't be
     # computed, e.g. target unreachable — fall through and let osync report it.)
@@ -1195,10 +1364,23 @@ def guarded_sync(name: str) -> int:
     guard = int(parse_settings().get("delete_guard", 0) or 0)
     dels = pending_deletions(pend)
     if guard > 0 and dels > guard:
-        msg = f"{name}: {dels} deletions exceed the guard of {guard} — sync skipped."
-        notify("osd · sync blocked", msg)
-        sys.stderr.write(msg + " Raise delete_guard or sync manually to override.\n")
-        return 3
+        # Only now, when we would otherwise block, is it worth indexing both
+        # trees to ask how many of those "deletions" are really relocations.
+        an = analyse_deletions(cfg, tgt, pend)
+        if an["real"] <= guard:
+            sys.stderr.write(
+                f"{name}: {dels} deletions, {an['moved']} of them moved files "
+                f"(same content under a new path) — {an['real']} real, within "
+                f"the guard of {guard}. Syncing.\n")
+        else:
+            detail = (f" ({dels} pending, {an['moved']} identified as moves)"
+                      if an["moved"] else "")
+            msg = (f"{name}: {an['real']} deletions exceed the guard of "
+                   f"{guard}{detail} — sync skipped.")
+            notify("osd · sync blocked", msg)
+            sys.stderr.write(f"{msg} Run `osd --deletions {name}` to see "
+                             f"what would go.\n")
+            return 3
     rc = subprocess.run([OSYNC_BIN, cfg["_configfile"], "--summary", "--no-prefix"]).returncode
     if rc != 0:
         notify("osd · sync failed", f"{name}: osync exited with code {rc}")
@@ -1925,6 +2107,9 @@ def main():
         elif a == "--guarded-sync":
             i += 1
             sys.exit(guarded_sync(args[i]))  # systemd ExecStart entry point
+        elif a == "--deletions":
+            i += 1
+            sys.exit(report_deletions(args[i]))
         elif a in ("-w", "--watch"):
             o["watch"] = True
         elif a in ("-p", "--print", "--once"):
