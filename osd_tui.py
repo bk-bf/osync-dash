@@ -958,8 +958,14 @@ class OsyncDash(App):
 
     # cards ---------------------------------------------------------------
     def _build_cards(self):
+        """Queue a rebuild. Textual removes widgets by posting a message, so the
+        old cards are still in the DOM when this returns — mounting a fresh card
+        with the same id right here would collide with the one on its way out."""
+        self.call_next(self._rebuild_cards)
+
+    async def _rebuild_cards(self):
         box = self.query_one("#cards", VerticalScroll)
-        box.remove_children()
+        await box.remove_children()
         if not self.conns:
             box.mount(Static(
                 "No outgoing connections on this node yet.\n\n"
@@ -1119,15 +1125,16 @@ class OsyncDash(App):
             data = []
         self.call_from_thread(self._apply_incoming, data)
 
-    def _apply_incoming(self, data):
+    async def _apply_incoming(self, data):
         self.incoming = data
         box = self.query_one("#cards", VerticalScroll)
-        for w in list(box.query(IncomingCard)) + list(box.query("#meshdiv")):
-            w.remove()
+        stale = list(box.query(IncomingCard)) + list(box.query("#meshdiv"))
+        if data:  # a receive-only node isn't "empty"
+            stale += list(box.query("#empty"))
+        if stale:
+            await box.remove_children(stale)   # await: same id is remounted below
         if not data:
             return
-        for w in list(box.query("#empty")):  # a receive-only node isn't "empty"
-            w.remove()
         box.mount(Static("── incoming pushes (peers → this node) ──", id="meshdiv"))
         for inc in data:
             card = IncomingCard(f"{inc['from_node']}-{inc['connection']}",
